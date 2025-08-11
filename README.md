@@ -1,5 +1,5 @@
-# Image Classification Using Transformers
+# Image Classification Using Transformers and Mobilenet
 
 # Dataset Link: https://www.kaggle.com/code/hassanraof/intel-image-classification/input
 
-# Model Accuracy: 93.27%
+# Transformer Model Accuracy: 93.27%
