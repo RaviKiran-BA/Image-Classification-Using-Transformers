@@ -27,7 +27,7 @@
 
 current
 
-"""
+"
 Flight Aerodynamic Coefficient Predictor — Desktop GUI
 =======================================================
 
@@ -58,7 +58,7 @@ Notes / things I changed vs your original script (read this):
   - Manual entry defaults: numeric features default to the median from
     training data, categorical features default to the most frequent
     category. This is just a convenience default, not a prediction.
-"""
+"
 
 import os
 import threading
@@ -755,7 +755,7 @@ if __name__ == "__main__":
 
 updated
 
-"""
+"
 Flight Aerodynamic Coefficient Predictor — Desktop GUI
 =======================================================
 
@@ -764,7 +764,7 @@ Dependencies (install once):
 
 Run:
     python flight_gui.py
-"""
+"
 
 import os
 import threading
@@ -1580,7 +1580,7 @@ def _display_plot(self, event=None):
 
 final
 
-"""
+"
 Flight Aerodynamic Coefficient Predictor — Desktop GUI
 =======================================================
 
@@ -1589,7 +1589,7 @@ Dependencies (install once):
 
 Run:
     python flight_gui.py
-"""
+"
 
 import os
 import threading
