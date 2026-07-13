@@ -18,3 +18,2371 @@
     "num_classes": 5,
     "accuracy": 0.9527333378791809
 }
+
+
+
+
+
+
+
+current
+
+"""
+Flight Aerodynamic Coefficient Predictor — Desktop GUI
+=======================================================
+
+What this does:
+  1. Load a training Excel file (Sheet1 = inputs, Sheet2 = outputs).
+  2. Let you tick/untick which of the ~82 input features to use.
+  3. Train per-output XGBoost models (same logic as your original script).
+  4. Predict either from a test Excel file, or from manual feature entry.
+
+Dependencies (install once):
+    pip install pandas numpy scikit-learn xgboost matplotlib openpyxl joblib
+
+Run:
+    python flight_gui.py
+
+Notes / things I changed vs your original script (read this):
+  - Hardcoded Windows paths are gone. You pick files through dialogs.
+  - print() calls were replaced with a log_fn so output goes to the GUI
+    log box instead of a console.
+  - matplotlib uses the 'Agg' backend and never calls plt.show() — GUI
+    frameworks and matplotlib's interactive show() do not mix well on a
+    background thread. Plots are still saved to disk as PNG.
+  - Training runs on a background thread so the window doesn't freeze.
+  - fillna(0) is still used for post-encoding NaNs, same as your script.
+    That's a real limitation you flagged yourself (structural absence vs
+    real zero) — this GUI does not fix that, it just exposes the same
+    behavior. Fix it at the data level if it matters for your results.
+  - Manual entry defaults: numeric features default to the median from
+    training data, categorical features default to the most frequent
+    category. This is just a convenience default, not a prediction.
+"""
+
+import os
+import threading
+import queue
+import traceback
+
+import numpy as np
+import pandas as pd
+import joblib
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox, scrolledtext
+
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import OrdinalEncoder
+from sklearn.metrics import r2_score
+from xgboost import XGBRegressor
+
+OUTPUT_COLS = ['']
+
+
+# ══════════════════════════════════════════════════════════════════
+#  CORE ML LOGIC (adapted from your script — same math, log_fn instead
+#  of print, and it operates on a user-selected feature subset)
+# ══════════════════════════════════════════════════════════════════
+
+def read_sheet1_columns(path):
+    """Just the header row of Sheet1 — used to populate the checkbox list."""
+    df = pd.read_excel(path, sheet_name='Sheet1', nrows=0)
+    return df.columns.tolist()
+
+
+def load_flight_data(path, selected_cols):
+    df_in = pd.read_excel(path, sheet_name='Sheet1')
+    df_out = pd.read_excel(path, sheet_name='Sheet2')
+    missing = [c for c in selected_cols if c not in df_in.columns]
+    if missing:
+        raise ValueError(f"Selected columns not found in Sheet1: {missing}")
+    return df_in[selected_cols], df_out[OUTPUT_COLS]
+
+
+def fit_encoder(df, log_fn=print):
+    df = df.copy()
+    cat_cols = df.select_dtypes(include=['object', 'category']).columns.tolist()
+    if not cat_cols:
+        return None, cat_cols
+    for col in cat_cols:
+        df[col] = df[col].astype(str).str.strip().str.lower()
+    encoder = OrdinalEncoder(handle_unknown='use_encoded_value',
+                              unknown_value=-1, encoded_missing_value=-2)
+    encoder.fit(df[cat_cols])
+    log_fn(f"[INFO] Encoder fitted | cat cols ({len(cat_cols)}): {cat_cols}")
+    return encoder, cat_cols
+
+
+def encode_cat(df, encoder, cat_cols):
+    df = df.copy()
+    if not cat_cols:
+        return df
+    for col in cat_cols:
+        df[col] = df[col].astype(str).str.strip().str.lower()
+    df[cat_cols] = encoder.transform(df[cat_cols])
+    return df
+
+
+def preprocess_inputs(df, encoder, cat_cols, log_fn=print):
+    df_enc = encode_cat(df.copy(), encoder, cat_cols)
+    df_enc = df_enc.apply(pd.to_numeric, errors='coerce')
+    nan_counts = df_enc.isna().sum()
+    if nan_counts.any():
+        log_fn("[WARN] NaN values after encoding (filled with 0):")
+        log_fn(nan_counts[nan_counts > 0].to_string())
+    df_enc = df_enc.fillna(0)
+    return df_enc.to_numpy()
+
+
+def calculate_percentage_error(actual, predicted):
+    actual = np.array(actual, dtype=float)
+    predicted = np.array(predicted, dtype=float)
+    denom = np.where(np.abs(actual) < 1e-10, 1e-10, np.abs(actual))
+    return ((predicted - actual) / denom) * 100
+
+
+def train_xgb_model(X, y, log_fn=print, stop_flag=None):
+    X_train_raw, X_test_raw, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42, shuffle=True
+    )
+    log_fn(f"[INFO] Train: {X_train_raw.shape}  Test: {X_test_raw.shape}")
+
+    input_cols = X.columns.tolist()
+    encoder, cat_cols = fit_encoder(X_train_raw, log_fn)
+    X_train_enc = preprocess_inputs(X_train_raw, encoder, cat_cols, log_fn)
+    X_test_enc = preprocess_inputs(X_test_raw, encoder, cat_cols, log_fn)
+    log_fn(f"[INFO] Features going into model: {X_train_enc.shape[1]}")
+
+    # Defaults for the manual-entry form later: median (numeric) /
+    # most-frequent raw value (categorical), computed from TRAIN data only.
+    defaults = {}
+    raw_categories = {}
+    for col in input_cols:
+        if col in cat_cols:
+            vals = X_train_raw[col].astype(str).str.strip()
+            defaults[col] = vals.mode().iloc[0] if not vals.mode().empty else ""
+            raw_categories[col] = sorted(vals.unique().tolist())
+        else:
+            defaults[col] = float(pd.to_numeric(X_train_raw[col], errors='coerce').median())
+
+    log_fn("\n[STEP] Training per-output models with early stopping ...")
+    xgb_params = {
+        'max_depth': 4, 'min_child_weight': 10, 'colsample_bytree': 0.8,
+        'subsample': 0.8, 'reg_alpha': 0.1, 'reg_lambda': 5, 'gamma': 0.1,
+    }
+
+    per_output_models = []
+    for i, col in enumerate(y.columns):
+        if stop_flag is not None and stop_flag.is_set():
+            log_fn("[INFO] Training cancelled.")
+            return None
+        xgb = XGBRegressor(
+            n_estimators=2500, learning_rate=0.02, objective='reg:squarederror',
+            tree_method='hist', random_state=42, max_bin=256,
+            importance_type='gain', verbosity=0, early_stopping_rounds=50,
+            **xgb_params
+        )
+        y_train_col = y_train.iloc[:, i]
+        y_test_col = y_test.iloc[:, i]
+        xgb.fit(X_train_enc, y_train_col, eval_set=[(X_test_enc, y_test_col)], verbose=False)
+        per_output_models.append(xgb)
+        log_fn(f"  {col}: stopped at {xgb.best_iteration} / 2500 rounds")
+
+    y_pred = np.column_stack([m.predict(X_test_enc) for m in per_output_models])
+    y_train_pred = np.column_stack([m.predict(X_train_enc) for m in per_output_models])
+
+    train_r2 = r2_score(y_train, y_train_pred)
+    test_r2 = r2_score(y_test, y_pred)
+    log_fn(f"\n[RESULT] Train R^2: {train_r2:.4f}")
+    log_fn(f"[RESULT] Test R^2 : {test_r2:.4f}")
+    gap = train_r2 - test_r2
+    if gap > 0.05:
+        log_fn(f"[WARN] Train/Test R^2 gap = {gap:.4f} — possible overfitting.")
+
+    per_coeff = {}
+    for i, col in enumerate(y.columns):
+        actual = y_test.iloc[:, i].values
+        predicted = y_pred[:, i]
+        per_coeff[col] = {'R2': round(r2_score(actual, predicted), 4)}
+
+    global_r2 = r2_score(y_test.to_numpy(), y_pred)
+    log_fn(f"\n[RESULT] Global R^2: {global_r2:.4f}")
+
+    return {
+        'models': per_output_models, 'encoder': encoder, 'input_cols': input_cols,
+        'cat_cols': cat_cols, 'global_r2': global_r2, 'per_coeff': per_coeff,
+        'xgb_params': xgb_params, 'X_test': X_test_raw, 'y_test': y_test, 'y_pred': y_pred,
+        'defaults': defaults, 'raw_categories': raw_categories,
+        'metadata': {
+            'n_input_features': X_train_enc.shape[1], 'train_r2': round(train_r2, 4),
+            'test_r2': round(test_r2, 4), 'global_r2': round(global_r2, 4),
+        }
+    }
+
+
+def plot_trends(X_test, y_test, y_pred, output_cols, out_path, title_suffix="Training"):
+    if 'ALPHA' not in X_test.columns:
+        return None
+    alpha_values = X_test['ALPHA'].values
+    idx = np.argsort(alpha_values)
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    fig.suptitle(f'{title_suffix} — Actual vs Predicted', fontsize=16, fontweight='bold')
+    axes = axes.flatten()
+    for i, col in enumerate(output_cols):
+        y_actual = y_test[col].values if hasattr(y_test, 'columns') else y_test[:, i]
+        y_p, y_a = y_pred[idx, i], y_actual[idx]
+        all_vals = np.concatenate([y_a, y_p])
+        margin = (all_vals.max() - all_vals.min()) * 0.1 or 1.0
+        axes[i].set_ylim(all_vals.min() - margin, all_vals.max() + margin)
+        axes[i].plot(alpha_values[idx], y_a, 'o-', label='Actual', alpha=0.6, markersize=4)
+        axes[i].plot(alpha_values[idx], y_p, 's--', label='Predicted', alpha=0.6, markersize=4)
+        axes[i].set_title(f'ALPHA vs {col}', fontweight='bold')
+        axes[i].set_xlabel('ALPHA (deg)')
+        axes[i].set_ylabel(col)
+        axes[i].grid(True, alpha=0.3)
+        axes[i].legend()
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    fname = os.path.join(out_path, f"{title_suffix}_Trends.png")
+    plt.savefig(fname, dpi=200, bbox_inches='tight')
+    plt.close(fig)
+    return fname
+
+
+def plot_percentage_errors(X_df, y_df, preds, output_cols, out_path, title_suffix="Training"):
+    if 'ALPHA' not in X_df.columns:
+        return None, None
+    alpha_values = X_df['ALPHA'].values
+    idx = np.argsort(alpha_values)
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    fig.suptitle(f'{title_suffix} — %% Error Analysis', fontsize=16, fontweight='bold')
+    axes = axes.flatten()
+    tol_rows = []
+    for i, col in enumerate(output_cols):
+        actual = y_df[col].values if hasattr(y_df, 'columns') else y_df[:, i]
+        predicted = preds[:, i]
+        pct = calculate_percentage_error(actual, predicted)
+        abs_pct = np.abs(pct)
+        total = len(pct)
+        within = int(np.sum(abs_pct < 10.0))
+        tol_rows.append({'coefficient': col, 'total_points': total, 'within_10pct': within,
+                          'pct_within_tol': round((within / total) * 100, 2)})
+        clip_top = min(50, np.percentile(abs_pct, 98) * 1.2) or 10
+        axes[i].plot(alpha_values[idx], abs_pct[idx], 'o-', color='darkred', alpha=0.6, markersize=3)
+        axes[i].axhline(5.0, color='green', linestyle='--', label='5% target')
+        axes[i].axhline(10.0, color='orange', linestyle='--', label='10% tolerance')
+        axes[i].set_title(f'{col} %% Error vs ALPHA')
+        axes[i].set_ylim(0, clip_top)
+        axes[i].grid(True, alpha=0.3)
+        axes[i].legend()
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    fname = os.path.join(out_path, f"{title_suffix}_PercentageErrors.png")
+    plt.savefig(fname, dpi=200, bbox_inches='tight')
+    plt.close(fig)
+    return fname, pd.DataFrame(tol_rows)
+
+
+def predict_from_file(model_data, test_path, out_dir, log_fn=print):
+    df_in = pd.read_excel(test_path, sheet_name='Sheet1')
+    df_out = pd.read_excel(test_path, sheet_name='Sheet2')
+    input_cols = model_data['input_cols']
+    missing = set(input_cols) - set(df_in.columns)
+    if missing:
+        log_fn(f"[WARN] Missing columns in test file (filled with 0): {missing}")
+        for c in missing:
+            df_in[c] = 0
+
+    X_enc = preprocess_inputs(df_in[input_cols], model_data['encoder'], model_data['cat_cols'], log_fn)
+    models = model_data['models']
+    preds = np.column_stack([m.predict(X_enc) for m in models])
+
+    result_df = pd.DataFrame()
+    if 'ALPHA' in df_in.columns:
+        result_df['ALPHA'] = df_in['ALPHA'].values
+    for i, col in enumerate(OUTPUT_COLS):
+        actual = df_out[col].values if col in df_out.columns else np.full(len(df_in), np.nan)
+        predicted = preds[:, i]
+        pct = calculate_percentage_error(actual, predicted)
+        result_df[f'{col}_Actual'] = actual
+        result_df[f'{col}_Predicted'] = predicted
+        result_df[f'{col}_%Error'] = pct
+
+    trend_png = plot_trends(df_in, df_out[OUTPUT_COLS], preds, OUTPUT_COLS, out_dir, "Test_File")
+    err_png, df_tol = plot_percentage_errors(df_in, df_out[OUTPUT_COLS], preds, OUTPUT_COLS, out_dir, "Test_File")
+
+    final_path = os.path.join(out_dir, "Predictions.xlsx")
+    with pd.ExcelWriter(final_path, engine='openpyxl') as writer:
+        result_df.to_excel(writer, sheet_name='Predictions', index=False)
+        if df_tol is not None:
+            df_tol.to_excel(writer, sheet_name='Tolerance_Summary', index=False)
+
+    log_fn(f"[INFO] Predictions saved -> {final_path}")
+    if trend_png:
+        log_fn(f"[INFO] Trend plot saved -> {trend_png}")
+    if err_png:
+        log_fn(f"[INFO] Error plot saved -> {err_png}")
+    return result_df, df_tol, final_path
+
+
+def predict_manual(model_data, feature_values: dict):
+    row = {c: feature_values.get(c, model_data['defaults'].get(c, 0)) for c in model_data['input_cols']}
+    df = pd.DataFrame([row])
+    X_enc = preprocess_inputs(df, model_data['encoder'], model_data['cat_cols'], log_fn=lambda *_: None)
+    preds = np.column_stack([m.predict(X_enc) for m in model_data['models']])
+    return dict(zip(OUTPUT_COLS, preds[0]))
+
+
+# ══════════════════════════════════════════════════════════════════
+#  GUI
+# ══════════════════════════════════════════════════════════════════
+
+class ScrollableFrame(ttk.Frame):
+    """A frame with a vertical scrollbar — used for the feature checklist
+    and the manual-entry form, since 80+ widgets won't fit on screen."""
+    def __init__(self, parent, height=350, **kwargs):
+        super().__init__(parent, **kwargs)
+        canvas = tk.Canvas(self, height=height, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(self, orient="vertical", command=canvas.yview)
+        self.inner = ttk.Frame(canvas)
+
+        self.inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.create_window((0, 0), window=self.inner, anchor="nw")
+        canvas.configure(yscrollcommand=scrollbar.set)
+
+        canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        def _on_mousewheel(event):
+            canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        canvas.bind_all("<MouseWheel>", _on_mousewheel)
+
+
+class FlightApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Flight Aerodynamic Coefficient Predictor")
+        self.geometry("980x720")
+
+        self.training_path = None
+        self.all_columns = []
+        self.feature_vars = {}       # col -> BooleanVar
+        self.checkbox_widgets = {}   # col -> Checkbutton (for filtering)
+        self.output_dir = os.getcwd()
+        self.model_data = None       # populated after training / loading
+
+        self.msg_queue = queue.Queue()
+        self.stop_flag = threading.Event()
+
+        self._build_ui()
+        self.after(100, self._poll_queue)
+
+    # ---------------- UI scaffolding ----------------
+
+    def _build_ui(self):
+        nb = ttk.Notebook(self)
+        nb.pack(fill="both", expand=True, padx=8, pady=8)
+
+        self.tab_data = ttk.Frame(nb)
+        self.tab_train = ttk.Frame(nb)
+        self.tab_predict = ttk.Frame(nb)
+        nb.add(self.tab_data, text="1. Data & Features")
+        nb.add(self.tab_train, text="2. Train")
+        nb.add(self.tab_predict, text="3. Predict")
+
+        self._build_tab_data()
+        self._build_tab_train()
+        self._build_tab_predict()
+
+    # ---------------- Tab 1: Data & Features ----------------
+
+    def _build_tab_data(self):
+        top = ttk.Frame(self.tab_data)
+        top.pack(fill="x", padx=10, pady=10)
+
+        ttk.Button(top, text="Browse Training File (.xlsx)", command=self._browse_training_file).pack(side="left")
+        self.lbl_train_path = ttk.Label(top, text="No file loaded", foreground="gray")
+        self.lbl_train_path.pack(side="left", padx=10)
+
+        filt_row = ttk.Frame(self.tab_data)
+        filt_row.pack(fill="x", padx=10)
+        ttk.Label(filt_row, text="Filter:").pack(side="left")
+        self.filter_var = tk.StringVar()
+        self.filter_var.trace_add("write", lambda *a: self._apply_filter())
+        ttk.Entry(filt_row, textvariable=self.filter_var, width=30).pack(side="left", padx=5)
+        ttk.Button(filt_row, text="Select All", command=lambda: self._set_all(True)).pack(side="left", padx=5)
+        ttk.Button(filt_row, text="Deselect All", command=lambda: self._set_all(False)).pack(side="left")
+
+        self.lbl_count = ttk.Label(filt_row, text="0 of 0 selected", foreground="blue")
+        self.lbl_count.pack(side="right")
+
+        self.scroll_frame = ScrollableFrame(self.tab_data, height=480)
+        self.scroll_frame.pack(fill="both", expand=True, padx=10, pady=10)
+
+    def _browse_training_file(self):
+        path = filedialog.askopenfilename(filetypes=[("Excel files", "*.xlsx")])
+        if not path:
+            return
+        try:
+            cols = read_sheet1_columns(path)
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not read Sheet1 from file:\n{e}")
+            return
+
+        self.training_path = path
+        self.all_columns = cols
+        self.lbl_train_path.config(text=os.path.basename(path), foreground="black")
+
+        for w in self.scroll_frame.inner.winfo_children():
+            w.destroy()
+        self.feature_vars.clear()
+        self.checkbox_widgets.clear()
+
+        for i, col in enumerate(cols):
+            var = tk.BooleanVar(value=True)
+            cb = ttk.Checkbutton(self.scroll_frame.inner, text=col, variable=var,
+                                  command=self._update_count)
+            cb.grid(row=i // 3, column=i % 3, sticky="w", padx=8, pady=2)
+            self.feature_vars[col] = var
+            self.checkbox_widgets[col] = cb
+
+        self._update_count()
+
+    def _apply_filter(self):
+        needle = self.filter_var.get().strip().lower()
+        for col, cb in self.checkbox_widgets.items():
+            visible = needle in col.lower()
+            if visible:
+                cb.grid()
+            else:
+                cb.grid_remove()
+
+    def _set_all(self, value):
+        needle = self.filter_var.get().strip().lower()
+        for col, var in self.feature_vars.items():
+            if needle in col.lower():
+                var.set(value)
+        self._update_count()
+
+    def _update_count(self):
+        selected = sum(v.get() for v in self.feature_vars.values())
+        total = len(self.feature_vars)
+        self.lbl_count.config(text=f"{selected} of {total} selected")
+
+    def get_selected_columns(self):
+        return [c for c, v in self.feature_vars.items() if v.get()]
+
+    # ---------------- Tab 2: Train ----------------
+
+    def _build_tab_train(self):
+        top = ttk.Frame(self.tab_train)
+        top.pack(fill="x", padx=10, pady=10)
+
+        ttk.Button(top, text="Choose Output Folder", command=self._choose_output_dir).pack(side="left")
+        self.lbl_out_dir = ttk.Label(top, text=self.output_dir, foreground="gray")
+        self.lbl_out_dir.pack(side="left", padx=10)
+
+        btn_row = ttk.Frame(self.tab_train)
+        btn_row.pack(fill="x", padx=10)
+        self.btn_train = ttk.Button(btn_row, text="Train Model", command=self._start_training)
+        self.btn_train.pack(side="left")
+        ttk.Button(btn_row, text="Save Trained Model (.pkl)", command=self._save_model).pack(side="left", padx=8)
+        ttk.Button(btn_row, text="Load Model (.pkl)", command=self._load_model).pack(side="left")
+
+        self.progress = ttk.Progressbar(self.tab_train, mode="indeterminate")
+        self.progress.pack(fill="x", padx=10, pady=8)
+
+        self.log_box = scrolledtext.ScrolledText(self.tab_train, height=28, font=("Consolas", 9))
+        self.log_box.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+    def _choose_output_dir(self):
+        d = filedialog.askdirectory()
+        if d:
+            self.output_dir = d
+            self.lbl_out_dir.config(text=d, foreground="black")
+
+    def _log(self, msg):
+        self.msg_queue.put(("log", str(msg)))
+
+    def _start_training(self):
+        if not self.training_path:
+            messagebox.showwarning("No file", "Load a training file on Tab 1 first.")
+            return
+        selected = self.get_selected_columns()
+        if len(selected) == 0:
+            messagebox.showwarning("No features", "Select at least one feature on Tab 1.")
+            return
+
+        self.log_box.delete("1.0", tk.END)
+        self.btn_train.config(state="disabled")
+        self.progress.start(10)
+        self.stop_flag.clear()
+
+        t = threading.Thread(target=self._train_worker, args=(selected,), daemon=True)
+        t.start()
+
+    def _train_worker(self, selected_cols):
+        try:
+            X, y = load_flight_data(self.training_path, selected_cols)
+            self._log(f"[INFO] Training samples: {len(X)}  |  Selected features: {len(selected_cols)}")
+            results = train_xgb_model(X, y, log_fn=self._log, stop_flag=self.stop_flag)
+            if results is None:
+                self.msg_queue.put(("train_done", None))
+                return
+
+            os.makedirs(self.output_dir, exist_ok=True)
+            tp = plot_trends(results['X_test'], results['y_test'], results['y_pred'],
+                              OUTPUT_COLS, self.output_dir, "Training")
+            ep, df_tol = plot_percentage_errors(results['X_test'], results['y_test'], results['y_pred'],
+                                                 OUTPUT_COLS, self.output_dir, "Training")
+            if tp:
+                self._log(f"[INFO] Trend plot saved -> {tp}")
+            if ep:
+                self._log(f"[INFO] Error plot saved -> {ep}")
+
+            self.msg_queue.put(("train_done", results))
+        except Exception:
+            self._log("[ERROR] Training failed:\n" + traceback.format_exc())
+            self.msg_queue.put(("train_done", None))
+
+    # ---------------- Tab 3: Predict ----------------
+
+    def _build_tab_predict(self):
+        mode_row = ttk.Frame(self.tab_predict)
+        mode_row.pack(fill="x", padx=10, pady=10)
+        self.predict_mode = tk.StringVar(value="file")
+        ttk.Radiobutton(mode_row, text="Predict from Test File", variable=self.predict_mode,
+                        value="file", command=self._refresh_predict_view).pack(side="left")
+        ttk.Radiobutton(mode_row, text="Manual Entry", variable=self.predict_mode,
+                        value="manual", command=self._refresh_predict_view).pack(side="left", padx=15)
+
+        self.predict_body = ttk.Frame(self.tab_predict)
+        self.predict_body.pack(fill="both", expand=True, padx=10, pady=10)
+
+        self._build_predict_file_view()
+        self._build_predict_manual_view()
+        self._refresh_predict_view()
+
+    def _build_predict_file_view(self):
+        self.frame_predict_file = ttk.Frame(self.predict_body)
+        top = ttk.Frame(self.frame_predict_file)
+        top.pack(fill="x")
+        ttk.Button(top, text="Browse Test File (.xlsx)", command=self._browse_test_file).pack(side="left")
+        self.lbl_test_path = ttk.Label(top, text="No file selected", foreground="gray")
+        self.lbl_test_path.pack(side="left", padx=10)
+        ttk.Button(top, text="Run Prediction", command=self._run_file_prediction).pack(side="left", padx=10)
+
+        self.predict_log = scrolledtext.ScrolledText(self.frame_predict_file, height=28, font=("Consolas", 9))
+        self.predict_log.pack(fill="both", expand=True, pady=10)
+        self.test_path = None
+
+    def _build_predict_manual_view(self):
+        self.frame_predict_manual = ttk.Frame(self.predict_body)
+        top = ttk.Frame(self.frame_predict_manual)
+        top.pack(fill="x")
+        ttk.Label(top, text="Values default to training median / most common category.",
+                  foreground="gray").pack(side="left")
+        ttk.Button(top, text="Predict", command=self._run_manual_prediction).pack(side="right")
+
+        self.manual_scroll = ScrollableFrame(self.frame_predict_manual, height=420)
+        self.manual_scroll.pack(fill="both", expand=True, pady=10)
+        self.manual_entries = {}  # col -> widget
+
+        self.manual_result = ttk.LabelFrame(self.frame_predict_manual, text="Predicted Coefficients")
+        self.manual_result.pack(fill="x", pady=5)
+        self.manual_result_labels = {}
+        for i, col in enumerate(OUTPUT_COLS):
+            ttk.Label(self.manual_result, text=f"{col}:").grid(row=0, column=2 * i, sticky="e", padx=4, pady=6)
+            lbl = ttk.Label(self.manual_result, text="—", width=12, foreground="blue", font=("Consolas", 10, "bold"))
+            lbl.grid(row=0, column=2 * i + 1, sticky="w", padx=4)
+            self.manual_result_labels[col] = lbl
+
+    def _refresh_predict_view(self):
+        self.frame_predict_file.pack_forget()
+        self.frame_predict_manual.pack_forget()
+        if self.predict_mode.get() == "file":
+            self.frame_predict_file.pack(fill="both", expand=True)
+        else:
+            self.frame_predict_manual.pack(fill="both", expand=True)
+            self._populate_manual_form()
+
+    def _populate_manual_form(self):
+        for w in self.manual_scroll.inner.winfo_children():
+            w.destroy()
+        self.manual_entries.clear()
+
+        if self.model_data is None:
+            ttk.Label(self.manual_scroll.inner, text="Train or load a model first (Tab 2).",
+                      foreground="red").grid(row=0, column=0, padx=10, pady=10)
+            return
+
+        cols = self.model_data['input_cols']
+        cat_cols = set(self.model_data['cat_cols'])
+        raw_categories = self.model_data.get('raw_categories', {})
+        defaults = self.model_data.get('defaults', {})
+
+        for i, col in enumerate(cols):
+            r, c = divmod(i, 2)
+            ttk.Label(self.manual_scroll.inner, text=col).grid(row=r, column=c * 2, sticky="e", padx=6, pady=3)
+            if col in cat_cols:
+                var = tk.StringVar(value=str(defaults.get(col, "")))
+                widget = ttk.Combobox(self.manual_scroll.inner, textvariable=var,
+                                       values=raw_categories.get(col, []), width=18, state="normal")
+            else:
+                var = tk.StringVar(value=str(defaults.get(col, 0)))
+                widget = ttk.Entry(self.manual_scroll.inner, textvariable=var, width=20)
+            widget.grid(row=r, column=c * 2 + 1, sticky="w", padx=6, pady=3)
+            self.manual_entries[col] = var
+
+    def _run_manual_prediction(self):
+        if self.model_data is None:
+            messagebox.showwarning("No model", "Train or load a model first.")
+            return
+        values = {}
+        for col, var in self.manual_entries.items():
+            raw = var.get()
+            if col in self.model_data['cat_cols']:
+                values[col] = raw
+            else:
+                try:
+                    values[col] = float(raw)
+                except ValueError:
+                    messagebox.showerror("Invalid value", f"'{raw}' is not a number for feature '{col}'.")
+                    return
+        try:
+            preds = predict_manual(self.model_data, values)
+        except Exception:
+            messagebox.showerror("Prediction failed", traceback.format_exc())
+            return
+        for col, lbl in self.manual_result_labels.items():
+            lbl.config(text=f"{preds[col]:.5f}")
+
+    def _browse_test_file(self):
+        path = filedialog.askopenfilename(filetypes=[("Excel files", "*.xlsx")])
+        if path:
+            self.test_path = path
+            self.lbl_test_path.config(text=os.path.basename(path), foreground="black")
+
+    def _run_file_prediction(self):
+        if self.model_data is None:
+            messagebox.showwarning("No model", "Train or load a model first (Tab 2).")
+            return
+        if not self.test_path:
+            messagebox.showwarning("No file", "Choose a test file first.")
+            return
+
+        self.predict_log.delete("1.0", tk.END)
+
+        def worker():
+            def log(msg):
+                self.msg_queue.put(("predict_log", str(msg)))
+            try:
+                os.makedirs(self.output_dir, exist_ok=True)
+                df_result, df_tol, path = predict_from_file(self.model_data, self.test_path, self.output_dir, log)
+                log("\n[TOLERANCE SUMMARY]")
+                if df_tol is not None:
+                    log(df_tol.to_string(index=False))
+                log(f"\n[DONE] Results saved to: {path}")
+            except Exception:
+                log("[ERROR] Prediction failed:\n" + traceback.format_exc())
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    # ---------------- Model save/load ----------------
+
+    def _save_model(self):
+        if self.model_data is None:
+            messagebox.showwarning("No model", "Train a model first.")
+            return
+        path = filedialog.asksaveasfilename(defaultextension=".pkl", filetypes=[("Model files", "*.pkl")])
+        if not path:
+            return
+        joblib.dump(self.model_data, path)
+        messagebox.showinfo("Saved", f"Model saved to:\n{path}")
+
+    def _load_model(self):
+        path = filedialog.askopenfilename(filetypes=[("Model files", "*.pkl")])
+        if not path:
+            return
+        try:
+            self.model_data = joblib.load(path)
+        except Exception as e:
+            messagebox.showerror("Load failed", str(e))
+            return
+        self._log(f"[INFO] Model loaded from {path}")
+        self._log(f"[INFO] Features in model: {len(self.model_data['input_cols'])}")
+        messagebox.showinfo("Loaded", "Model loaded. Go to Tab 3 to predict.")
+
+    # ---------------- Queue polling (background thread -> UI thread) ----------------
+
+    def _poll_queue(self):
+        try:
+            while True:
+                kind, payload = self.msg_queue.get_nowait()
+                if kind == "log":
+                    self.log_box.insert(tk.END, payload + "\n")
+                    self.log_box.see(tk.END)
+                elif kind == "predict_log":
+                    self.predict_log.insert(tk.END, payload + "\n")
+                    self.predict_log.see(tk.END)
+                elif kind == "train_done":
+                    self.progress.stop()
+                    self.btn_train.config(state="normal")
+                    if payload is not None:
+                        self.model_data = payload
+                        m = payload['metadata']
+                        self.log_box.insert(
+                            tk.END,
+                            f"\n[SUMMARY] Train R2={m['train_r2']}  Test R2={m['test_r2']}  "
+                            f"Global R2={m['global_r2']}\n"
+                        )
+                        self.log_box.see(tk.END)
+                        messagebox.showinfo("Training complete",
+                                             f"Global R^2: {m['global_r2']}\nTest R^2: {m['test_r2']}")
+        except queue.Empty:
+            pass
+        self.after(100, self._poll_queue)
+
+
+if __name__ == "__main__":
+    app = FlightApp()
+    app.mainloop()
+
+
+
+updated
+
+"""
+Flight Aerodynamic Coefficient Predictor — Desktop GUI
+=======================================================
+
+Dependencies (install once):
+    pip install pandas numpy scikit-learn xgboost matplotlib openpyxl joblib pillow
+
+Run:
+    python flight_gui.py
+"""
+
+import os
+import threading
+import queue
+import traceback
+
+import numpy as np
+import pandas as pd
+import joblib
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox, scrolledtext
+
+try:
+    from PIL import Image, ImageTk
+    HAS_PIL = True
+except ImportError:
+    HAS_PIL = False
+
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import OrdinalEncoder
+from sklearn.metrics import r2_score
+from xgboost import XGBRegressor
+
+OUTPUT_COLS = ['']
+
+
+# ══════════════════════════════════════════════════════════════════
+#  CORE ML LOGIC
+# ══════════════════════════════════════════════════════════════════
+
+def read_sheet1_columns(path):
+    df = pd.read_excel(path, sheet_name='Sheet1', nrows=0)
+    return df.columns.tolist()
+
+def load_flight_data(path, selected_cols):
+    df_in = pd.read_excel(path, sheet_name='Sheet1')
+    df_out = pd.read_excel(path, sheet_name='Sheet2')
+    missing = [c for c in selected_cols if c not in df_in.columns]
+    if missing:
+        raise ValueError(f"Selected columns not found in Sheet1: {missing}")
+    return df_in[selected_cols], df_out[OUTPUT_COLS]
+
+def fit_encoder(df, log_fn=print):
+    df = df.copy()
+    cat_cols = df.select_dtypes(include=['object', 'category']).columns.tolist()
+    if not cat_cols:
+        return None, cat_cols
+    for col in cat_cols:
+        df[col] = df[col].astype(str).str.strip().str.lower()
+    encoder = OrdinalEncoder(handle_unknown='use_encoded_value',
+                              unknown_value=-1, encoded_missing_value=-2)
+    encoder.fit(df[cat_cols])
+    log_fn(f"[INFO] Encoder fitted | cat cols ({len(cat_cols)}): {cat_cols}")
+    return encoder, cat_cols
+
+def encode_cat(df, encoder, cat_cols):
+    df = df.copy()
+    if not cat_cols:
+        return df
+    for col in cat_cols:
+        df[col] = df[col].astype(str).str.strip().str.lower()
+    df[cat_cols] = encoder.transform(df[cat_cols])
+    return df
+
+def preprocess_inputs(df, encoder, cat_cols, log_fn=print):
+    df_enc = encode_cat(df.copy(), encoder, cat_cols)
+    df_enc = df_enc.apply(pd.to_numeric, errors='coerce')
+    nan_counts = df_enc.isna().sum()
+    if nan_counts.any():
+        log_fn("[WARN] NaN values after encoding (filled with 0):")
+        log_fn(nan_counts[nan_counts > 0].to_string())
+    df_enc = df_enc.fillna(0)
+    return df_enc.to_numpy()
+
+def calculate_percentage_error(actual, predicted):
+    actual = np.array(actual, dtype=float)
+    predicted = np.array(predicted, dtype=float)
+    denom = np.where(np.abs(actual) < 1e-10, 1e-10, np.abs(actual))
+    return ((predicted - actual) / denom) * 100
+
+def train_xgb_model(X, y, custom_params=None, log_fn=print, stop_flag=None):
+    if custom_params is None:
+        custom_params = {}
+        
+    X_train_raw, X_test_raw, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42, shuffle=True
+    )
+    log_fn(f"[INFO] Train: {X_train_raw.shape}  Test: {X_test_raw.shape}")
+
+    input_cols = X.columns.tolist()
+    encoder, cat_cols = fit_encoder(X_train_raw, log_fn)
+    X_train_enc = preprocess_inputs(X_train_raw, encoder, cat_cols, log_fn)
+    X_test_enc = preprocess_inputs(X_test_raw, encoder, cat_cols, log_fn)
+    
+    defaults = {}
+    raw_categories = {}
+    for col in input_cols:
+        if col in cat_cols:
+            vals = X_train_raw[col].astype(str).str.strip()
+            defaults[col] = vals.mode().iloc[0] if not vals.mode().empty else ""
+            raw_categories[col] = sorted(vals.unique().tolist())
+        else:
+            defaults[col] = float(pd.to_numeric(X_train_raw[col], errors='coerce').median())
+
+    log_fn(f"\n[STEP] Training per-output models (n_estimators={custom_params.get('n_estimators')})...")
+    xgb_params = {
+        'max_depth': custom_params.get('max_depth', 4),
+        'min_child_weight': 10, 'colsample_bytree': 0.8,
+        'subsample': 0.8, 'reg_alpha': 0.1, 'reg_lambda': 5, 'gamma': 0.1,
+    }
+
+    per_output_models = []
+    for i, col in enumerate(y.columns):
+        if stop_flag is not None and stop_flag.is_set():
+            log_fn("[INFO] Training cancelled.")
+            return None
+        xgb = XGBRegressor(
+            n_estimators=custom_params.get('n_estimators', 2500), 
+            learning_rate=custom_params.get('learning_rate', 0.02), 
+            objective='reg:squarederror', tree_method='hist', random_state=42, max_bin=256,
+            importance_type='gain', verbosity=0, early_stopping_rounds=50,
+            **xgb_params
+        )
+        y_train_col = y_train.iloc[:, i]
+        y_test_col = y_test.iloc[:, i]
+        xgb.fit(X_train_enc, y_train_col, eval_set=[(X_test_enc, y_test_col)], verbose=False)
+        per_output_models.append(xgb)
+        log_fn(f"  {col}: stopped at {xgb.best_iteration} rounds")
+
+    y_pred = np.column_stack([m.predict(X_test_enc) for m in per_output_models])
+    y_train_pred = np.column_stack([m.predict(X_train_enc) for m in per_output_models])
+
+    train_r2 = r2_score(y_train, y_train_pred)
+    test_r2 = r2_score(y_test, y_pred)
+    log_fn(f"\n[RESULT] Train R^2: {train_r2:.4f}")
+    log_fn(f"[RESULT] Test R^2 : {test_r2:.4f}")
+    
+    per_coeff = {}
+    for i, col in enumerate(y.columns):
+        actual = y_test.iloc[:, i].values
+        predicted = y_pred[:, i]
+        per_coeff[col] = {'R2': round(r2_score(actual, predicted), 4)}
+
+    global_r2 = r2_score(y_test.to_numpy(), y_pred)
+    log_fn(f"[RESULT] Global R^2: {global_r2:.4f}")
+
+    return {
+        'models': per_output_models, 'encoder': encoder, 'input_cols': input_cols,
+        'cat_cols': cat_cols, 'global_r2': global_r2, 'per_coeff': per_coeff,
+        'xgb_params': xgb_params, 'X_test': X_test_raw, 'y_test': y_test, 'y_pred': y_pred,
+        'defaults': defaults, 'raw_categories': raw_categories,
+        'metadata': {
+            'n_input_features': X_train_enc.shape[1], 'train_r2': round(train_r2, 4),
+            'test_r2': round(test_r2, 4), 'global_r2': round(global_r2, 4),
+        }
+    }
+
+def plot_trends(X_test, y_test, y_pred, output_cols, out_path, title_suffix="Training"):
+    if 'ALPHA' not in X_test.columns:
+        return None
+    alpha_values = X_test['ALPHA'].values
+    idx = np.argsort(alpha_values)
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    fig.suptitle(f'{title_suffix} — Actual vs Predicted', fontsize=16, fontweight='bold')
+    axes = axes.flatten()
+    for i, col in enumerate(output_cols):
+        y_actual = y_test[col].values if hasattr(y_test, 'columns') else y_test[:, i]
+        y_p, y_a = y_pred[idx, i], y_actual[idx]
+        all_vals = np.concatenate([y_a, y_p])
+        margin = (all_vals.max() - all_vals.min()) * 0.1 or 1.0
+        axes[i].set_ylim(all_vals.min() - margin, all_vals.max() + margin)
+        axes[i].plot(alpha_values[idx], y_a, 'o-', label='Actual', alpha=0.6, markersize=4)
+        axes[i].plot(alpha_values[idx], y_p, 's--', label='Predicted', alpha=0.6, markersize=4)
+        axes[i].set_title(f'ALPHA vs {col}', fontweight='bold')
+        axes[i].set_xlabel('ALPHA (deg)')
+        axes[i].set_ylabel(col)
+        axes[i].grid(True, alpha=0.3)
+        axes[i].legend()
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    fname = os.path.join(out_path, f"{title_suffix}_Trends.png")
+    plt.savefig(fname, dpi=200, bbox_inches='tight')
+    plt.close(fig)
+    return fname
+
+def plot_percentage_errors(X_df, y_df, preds, output_cols, out_path, title_suffix="Training"):
+    if 'ALPHA' not in X_df.columns:
+        return None, None
+    alpha_values = X_df['ALPHA'].values
+    idx = np.argsort(alpha_values)
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    fig.suptitle(f'{title_suffix} — % Error Analysis', fontsize=16, fontweight='bold')
+    axes = axes.flatten()
+    tol_rows = []
+    for i, col in enumerate(output_cols):
+        actual = y_df[col].values if hasattr(y_df, 'columns') else y_df[:, i]
+        predicted = preds[:, i]
+        pct = calculate_percentage_error(actual, predicted)
+        abs_pct = np.abs(pct)
+        total = len(pct)
+        within = int(np.sum(abs_pct < 10.0))
+        tol_rows.append({'coefficient': col, 'total_points': total, 'within_10pct': within,
+                          'pct_within_tol': round((within / total) * 100, 2)})
+        clip_top = min(50, np.percentile(abs_pct, 98) * 1.2) or 10
+        axes[i].plot(alpha_values[idx], abs_pct[idx], 'o-', color='darkred', alpha=0.6, markersize=3)
+        axes[i].axhline(5.0, color='green', linestyle='--', label='5% target')
+        axes[i].axhline(10.0, color='orange', linestyle='--', label='10% tolerance')
+        axes[i].set_title(f'{col} % Error vs ALPHA')
+        axes[i].set_ylim(0, clip_top)
+        axes[i].grid(True, alpha=0.3)
+        axes[i].legend()
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    fname = os.path.join(out_path, f"{title_suffix}_PercentageErrors.png")
+    plt.savefig(fname, dpi=200, bbox_inches='tight')
+    plt.close(fig)
+    return fname, pd.DataFrame(tol_rows)
+
+def predict_from_file(model_data, test_path, out_dir, log_fn=print):
+    df_in = pd.read_excel(test_path, sheet_name='Sheet1')
+    df_out = pd.read_excel(test_path, sheet_name='Sheet2')
+    input_cols = model_data['input_cols']
+    missing = set(input_cols) - set(df_in.columns)
+    if missing:
+        log_fn(f"[WARN] Missing columns in test file (filled with 0): {missing}")
+        for c in missing:
+            df_in[c] = 0
+
+    X_enc = preprocess_inputs(df_in[input_cols], model_data['encoder'], model_data['cat_cols'], log_fn)
+    preds = np.column_stack([m.predict(X_enc) for m in model_data['models']])
+
+    result_df = pd.DataFrame()
+    if 'ALPHA' in df_in.columns:
+        result_df['ALPHA'] = df_in['ALPHA'].values
+    for i, col in enumerate(OUTPUT_COLS):
+        actual = df_out[col].values if col in df_out.columns else np.full(len(df_in), np.nan)
+        predicted = preds[:, i]
+        result_df[f'{col}_Actual'] = actual
+        result_df[f'{col}_Predicted'] = predicted
+        result_df[f'{col}_%Error'] = calculate_percentage_error(actual, predicted)
+
+    trend_png = plot_trends(df_in, df_out[OUTPUT_COLS], preds, OUTPUT_COLS, out_dir, "Test_File")
+    err_png, df_tol = plot_percentage_errors(df_in, df_out[OUTPUT_COLS], preds, OUTPUT_COLS, out_dir, "Test_File")
+
+    final_path = os.path.join(out_dir, "Predictions.xlsx")
+    with pd.ExcelWriter(final_path, engine='openpyxl') as writer:
+        result_df.to_excel(writer, sheet_name='Predictions', index=False)
+        if df_tol is not None:
+            df_tol.to_excel(writer, sheet_name='Tolerance_Summary', index=False)
+
+    return result_df, df_tol, final_path, trend_png, err_png
+
+def predict_manual(model_data, feature_values: dict):
+    row = {c: feature_values.get(c, model_data['defaults'].get(c, 0)) for c in model_data['input_cols']}
+    X_enc = preprocess_inputs(pd.DataFrame([row]), model_data['encoder'], model_data['cat_cols'], log_fn=lambda *_: None)
+    preds = np.column_stack([m.predict(X_enc) for m in model_data['models']])
+    return dict(zip(OUTPUT_COLS, preds[0]))
+
+
+# ══════════════════════════════════════════════════════════════════
+#  GUI
+# ══════════════════════════════════════════════════════════════════
+
+class ScrollableFrame(ttk.Frame):
+    """A frame with a robust cross-platform mouse wheel scroll integration."""
+    def __init__(self, parent, height=350, **kwargs):
+        super().__init__(parent, **kwargs)
+        self.canvas = tk.Canvas(self, height=height, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.inner = ttk.Frame(self.canvas)
+
+        self.inner.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+        self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
+        self.canvas.configure(yscrollcommand=scrollbar.set)
+
+        self.canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        # Bind hover events to activate scrolling ONLY when mouse is over this specific widget
+        self.canvas.bind("<Enter>", self._bind_mouse)
+        self.canvas.bind("<Leave>", self._unbind_mouse)
+
+    def _on_mousewheel(self, event):
+        # Linux supports event.num (4 up, 5 down). Windows/Mac use event.delta.
+        if hasattr(event, 'num') and event.num == 4:
+            self.canvas.yview_scroll(-1, "units")
+        elif hasattr(event, 'num') and event.num == 5:
+            self.canvas.yview_scroll(1, "units")
+        elif hasattr(event, 'delta') and event.delta != 0:
+            direction = -1 if event.delta > 0 else 1
+            self.canvas.yview_scroll(direction, "units")
+
+    def _bind_mouse(self, event):
+        self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+        self.canvas.bind_all("<Button-4>", self._on_mousewheel)
+        self.canvas.bind_all("<Button-5>", self._on_mousewheel)
+
+    def _unbind_mouse(self, event):
+        self.canvas.unbind_all("<MouseWheel>")
+        self.canvas.unbind_all("<Button-4>")
+        self.canvas.unbind_all("<Button-5>")
+
+
+class FlightApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Flight Aerodynamic Coefficient Predictor")
+        self.geometry("980x760")
+
+        self.training_path = None
+        self.all_columns = []
+        self.feature_vars = {}
+        self.checkbox_widgets = {}
+        self.output_dir = os.getcwd()
+        self.model_data = None
+
+        self.msg_queue = queue.Queue()
+        self.stop_flag = threading.Event()
+
+        self._build_ui()
+        self.after(100, self._poll_queue)
+
+    def _build_ui(self):
+        nb = ttk.Notebook(self)
+        nb.pack(fill="both", expand=True, padx=8, pady=8)
+
+        self.tab_data = ttk.Frame(nb)
+        self.tab_train = ttk.Frame(nb)
+        self.tab_predict = ttk.Frame(nb)
+        self.tab_visual = ttk.Frame(nb)
+        
+        nb.add(self.tab_data, text="1. Data & Features")
+        nb.add(self.tab_train, text="2. Train Model")
+        nb.add(self.tab_predict, text="3. Predict")
+        nb.add(self.tab_visual, text="4. Visualize Results")
+
+        self._build_tab_data()
+        self._build_tab_train()
+        self._build_tab_predict()
+        self._build_tab_visualize()
+
+    # ---------------- Tab 1: Data & Features ----------------
+
+    def _build_tab_data(self):
+        top = ttk.Frame(self.tab_data)
+        top.pack(fill="x", padx=10, pady=10)
+
+        ttk.Button(top, text="Browse Training File", command=self._browse_training_file).pack(side="left")
+        ttk.Button(top, text="Clear File", command=self._clear_training_file).pack(side="left", padx=5)
+        
+        self.lbl_train_path = ttk.Label(top, text="No file loaded", foreground="gray")
+        self.lbl_train_path.pack(side="left", padx=10)
+
+        filt_row = ttk.Frame(self.tab_data)
+        filt_row.pack(fill="x", padx=10)
+        ttk.Label(filt_row, text="Filter:").pack(side="left")
+        self.filter_var = tk.StringVar()
+        self.filter_var.trace_add("write", lambda *a: self._apply_filter())
+        ttk.Entry(filt_row, textvariable=self.filter_var, width=30).pack(side="left", padx=5)
+        ttk.Button(filt_row, text="Select All", command=lambda: self._set_all(True)).pack(side="left", padx=5)
+        ttk.Button(filt_row, text="Deselect All", command=lambda: self._set_all(False)).pack(side="left")
+
+        self.lbl_count = ttk.Label(filt_row, text="0 of 0 selected", foreground="blue")
+        self.lbl_count.pack(side="right")
+
+        self.scroll_frame = ScrollableFrame(self.tab_data, height=500)
+        self.scroll_frame.pack(fill="both", expand=True, padx=10, pady=10)
+
+    def _browse_training_file(self):
+        path = filedialog.askopenfilename(filetypes=[("Excel files", "*.xlsx")])
+        if not path: return
+        try:
+            cols = read_sheet1_columns(path)
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not read Sheet1 from file:\n{e}")
+            return
+
+        self.training_path = path
+        self.all_columns = cols
+        self.lbl_train_path.config(text=os.path.basename(path), foreground="black")
+
+        for w in self.scroll_frame.inner.winfo_children(): w.destroy()
+        self.feature_vars.clear()
+        self.checkbox_widgets.clear()
+
+        for i, col in enumerate(cols):
+            var = tk.BooleanVar(value=True)
+            cb = ttk.Checkbutton(self.scroll_frame.inner, text=col, variable=var, command=self._update_count)
+            cb.grid(row=i // 3, column=i % 3, sticky="w", padx=8, pady=2)
+            self.feature_vars[col] = var
+            self.checkbox_widgets[col] = cb
+
+        self._update_count()
+
+    def _clear_training_file(self):
+        self.training_path = None
+        self.all_columns = []
+        self.lbl_train_path.config(text="No file loaded", foreground="gray")
+        for w in self.scroll_frame.inner.winfo_children():
+            w.destroy()
+        self.feature_vars.clear()
+        self.checkbox_widgets.clear()
+        self._update_count()
+
+    def _apply_filter(self):
+        needle = self.filter_var.get().strip().lower()
+        for col, cb in self.checkbox_widgets.items():
+            if needle in col.lower():
+                cb.grid()
+            else:
+                cb.grid_remove()
+
+    def _set_all(self, value):
+        needle = self.filter_var.get().strip().lower()
+        for col, var in self.feature_vars.items():
+            if needle in col.lower(): var.set(value)
+        self._update_count()
+
+    def _update_count(self):
+        selected = sum(v.get() for v in self.feature_vars.values())
+        total = len(self.feature_vars)
+        self.lbl_count.config(text=f"{selected} of {total} selected")
+
+    def get_selected_columns(self):
+        return [c for c, v in self.feature_vars.items() if v.get()]
+
+    # ---------------- Tab 2: Train ----------------
+
+    def _build_tab_train(self):
+        top = ttk.Frame(self.tab_train)
+        top.pack(fill="x", padx=10, pady=5)
+        ttk.Button(top, text="Choose Output Folder", command=self._choose_output_dir).pack(side="left")
+        self.lbl_out_dir = ttk.Label(top, text=self.output_dir, foreground="gray")
+        self.lbl_out_dir.pack(side="left", padx=10)
+
+        # Hyperparameters
+        hp_frame = ttk.LabelFrame(self.tab_train, text="XGBoost Hyperparameters")
+        hp_frame.pack(fill="x", padx=10, pady=5)
+        
+        ttk.Label(hp_frame, text="Estimators:").pack(side="left", padx=5, pady=5)
+        self.hp_est = tk.IntVar(value=2500)
+        ttk.Entry(hp_frame, textvariable=self.hp_est, width=8).pack(side="left")
+
+        ttk.Label(hp_frame, text="Learning Rate:").pack(side="left", padx=(15,5))
+        self.hp_lr = tk.DoubleVar(value=0.02)
+        ttk.Entry(hp_frame, textvariable=self.hp_lr, width=8).pack(side="left")
+
+        ttk.Label(hp_frame, text="Max Depth:").pack(side="left", padx=(15,5))
+        self.hp_depth = tk.IntVar(value=4)
+        ttk.Entry(hp_frame, textvariable=self.hp_depth, width=8).pack(side="left")
+
+        btn_row = ttk.Frame(self.tab_train)
+        btn_row.pack(fill="x", padx=10, pady=5)
+        self.btn_train = ttk.Button(btn_row, text="Train Model", command=self._start_training)
+        self.btn_train.pack(side="left")
+        ttk.Button(btn_row, text="Save Model (.pkl)", command=self._save_model).pack(side="left", padx=8)
+        ttk.Button(btn_row, text="Load Model (.pkl)", command=self._load_model).pack(side="left")
+
+        self.progress = ttk.Progressbar(self.tab_train, mode="indeterminate")
+        self.progress.pack(fill="x", padx=10, pady=5)
+
+        self.log_box = scrolledtext.ScrolledText(self.tab_train, height=22, font=("Consolas", 9))
+        self.log_box.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+    def _choose_output_dir(self):
+        d = filedialog.askdirectory()
+        if d:
+            self.output_dir = d
+            self.lbl_out_dir.config(text=d, foreground="black")
+
+    def _log(self, msg):
+        self.msg_queue.put(("log", str(msg)))
+
+    def _start_training(self):
+        if not self.training_path:
+            messagebox.showwarning("No file", "Load a training file on Tab 1 first.")
+            return
+        selected = self.get_selected_columns()
+        if len(selected) == 0:
+            messagebox.showwarning("No features", "Select at least one feature on Tab 1.")
+            return
+
+        self.log_box.delete("1.0", tk.END)
+        self.btn_train.config(state="disabled")
+        self.progress.start(10)
+        self.stop_flag.clear()
+        
+        custom_params = {
+            'n_estimators': self.hp_est.get(),
+            'learning_rate': self.hp_lr.get(),
+            'max_depth': self.hp_depth.get()
+        }
+        
+        t = threading.Thread(target=self._train_worker, args=(selected, custom_params), daemon=True)
+        t.start()
+
+    def _train_worker(self, selected_cols, custom_params):
+        try:
+            X, y = load_flight_data(self.training_path, selected_cols)
+            self._log(f"[INFO] Training samples: {len(X)}  |  Selected features: {len(selected_cols)}")
+            results = train_xgb_model(X, y, custom_params=custom_params, log_fn=self._log, stop_flag=self.stop_flag)
+            
+            if results is None:
+                self.msg_queue.put(("train_done", None))
+                return
+
+            os.makedirs(self.output_dir, exist_ok=True)
+            tp = plot_trends(results['X_test'], results['y_test'], results['y_pred'], OUTPUT_COLS, self.output_dir, "Training")
+            ep, df_tol = plot_percentage_errors(results['X_test'], results['y_test'], results['y_pred'], OUTPUT_COLS, self.output_dir, "Training")
+            
+            if tp:
+                self._log(f"[INFO] Trend plot saved -> {tp}")
+                self.msg_queue.put(("new_plot", ("Training - Actual vs Predicted", tp)))
+            if ep:
+                self._log(f"[INFO] Error plot saved -> {ep}")
+                self.msg_queue.put(("new_plot", ("Training - % Error", ep)))
+
+            self.msg_queue.put(("train_done", results))
+        except Exception:
+            self._log("[ERROR] Training failed:\n" + traceback.format_exc())
+            self.msg_queue.put(("train_done", None))
+
+    # ---------------- Tab 3: Predict ----------------
+
+    def _build_tab_predict(self):
+        mode_row = ttk.Frame(self.tab_predict)
+        mode_row.pack(fill="x", padx=10, pady=10)
+        self.predict_mode = tk.StringVar(value="file")
+        ttk.Radiobutton(mode_row, text="Predict from Test File", variable=self.predict_mode,
+                        value="file", command=self._refresh_predict_view).pack(side="left")
+        ttk.Radiobutton(mode_row, text="Manual Entry", variable=self.predict_mode,
+                        value="manual", command=self._refresh_predict_view).pack(side="left", padx=15)
+
+        self.predict_body = ttk.Frame(self.tab_predict)
+        self.predict_body.pack(fill="both", expand=True, padx=10, pady=10)
+
+        self._build_predict_file_view()
+        self._build_predict_manual_view()
+        self._refresh_predict_view()
+
+    def _build_predict_file_view(self):
+        self.frame_predict_file = ttk.Frame(self.predict_body)
+        top = ttk.Frame(self.frame_predict_file)
+        top.pack(fill="x")
+        ttk.Button(top, text="Browse Test File", command=self._browse_test_file).pack(side="left")
+        self.lbl_test_path = ttk.Label(top, text="No file selected", foreground="gray")
+        self.lbl_test_path.pack(side="left", padx=10)
+        ttk.Button(top, text="Run Prediction", command=self._run_file_prediction).pack(side="left", padx=10)
+
+        self.predict_log = scrolledtext.ScrolledText(self.frame_predict_file, height=28, font=("Consolas", 9))
+        self.predict_log.pack(fill="both", expand=True, pady=10)
+        self.test_path = None
+
+    def _build_predict_manual_view(self):
+        self.frame_predict_manual = ttk.Frame(self.predict_body)
+        top = ttk.Frame(self.frame_predict_manual)
+        top.pack(fill="x")
+        ttk.Label(top, text="Values default to training median / most common category.", foreground="gray").pack(side="left")
+        ttk.Button(top, text="Predict", command=self._run_manual_prediction).pack(side="right")
+
+        self.manual_scroll = ScrollableFrame(self.frame_predict_manual, height=420)
+        self.manual_scroll.pack(fill="both", expand=True, pady=10)
+        self.manual_entries = {}
+
+        self.manual_result = ttk.LabelFrame(self.frame_predict_manual, text="Predicted Coefficients")
+        self.manual_result.pack(fill="x", pady=5)
+        self.manual_result_labels = {}
+        for i, col in enumerate(OUTPUT_COLS):
+            ttk.Label(self.manual_result, text=f"{col}:").grid(row=0, column=2 * i, sticky="e", padx=4, pady=6)
+            lbl = ttk.Label(self.manual_result, text="—", width=10, foreground="blue", font=("Consolas", 10, "bold"))
+            lbl.grid(row=0, column=2 * i + 1, sticky="w", padx=2)
+            self.manual_result_labels[col] = lbl
+
+    def _refresh_predict_view(self):
+        self.frame_predict_file.pack_forget()
+        self.frame_predict_manual.pack_forget()
+        if self.predict_mode.get() == "file":
+            self.frame_predict_file.pack(fill="both", expand=True)
+        else:
+            self.frame_predict_manual.pack(fill="both", expand=True)
+            self._populate_manual_form()
+
+    def _populate_manual_form(self):
+        for w in self.manual_scroll.inner.winfo_children():
+            w.destroy()
+        self.manual_entries.clear()
+
+        if self.model_data is None:
+            ttk.Label(self.manual_scroll.inner, text="Train or load a model first (Tab 2).", foreground="red").grid(row=0, column=0, padx=10, pady=10)
+            return
+
+        cols = self.model_data['input_cols']
+        cat_cols = set(self.model_data['cat_cols'])
+        raw_categories = self.model_data.get('raw_categories', {})
+        defaults = self.model_data.get('defaults', {})
+
+        for i, col in enumerate(cols):
+            r, c = divmod(i, 2)
+            ttk.Label(self.manual_scroll.inner, text=col).grid(row=r, column=c * 2, sticky="e", padx=6, pady=3)
+            if col in cat_cols:
+                var = tk.StringVar(value=str(defaults.get(col, "")))
+                widget = ttk.Combobox(self.manual_scroll.inner, textvariable=var, values=raw_categories.get(col, []), width=18, state="normal")
+            else:
+                var = tk.StringVar(value=str(defaults.get(col, 0)))
+                widget = ttk.Entry(self.manual_scroll.inner, textvariable=var, width=20)
+            widget.grid(row=r, column=c * 2 + 1, sticky="w", padx=6, pady=3)
+            self.manual_entries[col] = var
+
+    def _run_manual_prediction(self):
+        if self.model_data is None:
+            messagebox.showwarning("No model", "Train or load a model first.")
+            return
+        values = {}
+        for col, var in self.manual_entries.items():
+            raw = var.get()
+            if col in self.model_data['cat_cols']:
+                values[col] = raw
+            else:
+                try: values[col] = float(raw)
+                except ValueError:
+                    messagebox.showerror("Invalid value", f"'{raw}' is not a number for '{col}'.")
+                    return
+        try:
+            preds = predict_manual(self.model_data, values)
+        except Exception:
+            messagebox.showerror("Prediction failed", traceback.format_exc())
+            return
+        for col, lbl in self.manual_result_labels.items():
+            lbl.config(text=f"{preds[col]:.5f}")
+
+    def _browse_test_file(self):
+        path = filedialog.askopenfilename(filetypes=[("Excel files", "*.xlsx")])
+        if path:
+            self.test_path = path
+            self.lbl_test_path.config(text=os.path.basename(path), foreground="black")
+
+    def _run_file_prediction(self):
+        if self.model_data is None:
+            messagebox.showwarning("No model", "Train or load a model first (Tab 2).")
+            return
+        if not self.test_path:
+            messagebox.showwarning("No file", "Choose a test file first.")
+            return
+
+        self.predict_log.delete("1.0", tk.END)
+
+        def worker():
+            def log(msg): self.msg_queue.put(("predict_log", str(msg)))
+            try:
+                os.makedirs(self.output_dir, exist_ok=True)
+                df_result, df_tol, path, trend_png, err_png = predict_from_file(self.model_data, self.test_path, self.output_dir, log)
+                
+                if trend_png: self.msg_queue.put(("new_plot", ("Test - Actual vs Predicted", trend_png)))
+                if err_png: self.msg_queue.put(("new_plot", ("Test - % Error", err_png)))
+
+                log("\n[TOLERANCE SUMMARY]")
+                if df_tol is not None: log(df_tol.to_string(index=False))
+                log(f"\n[DONE] Results saved to: {path}")
+            except Exception:
+                log("[ERROR] Prediction failed:\n" + traceback.format_exc())
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    # ---------------- Tab 4: Visualize Results ----------------
+    
+    def _build_tab_visualize(self):
+        top = ttk.Frame(self.tab_visual)
+        top.pack(fill="x", padx=10, pady=10)
+        
+        ttk.Label(top, text="Select Plot to View:").pack(side="left")
+        self.plot_combo_var = tk.StringVar()
+        self.plot_combo = ttk.Combobox(top, textvariable=self.plot_combo_var, state="readonly", width=40)
+        self.plot_combo.pack(side="left", padx=10)
+        self.plot_combo.bind("<<ComboboxSelected>>", self._display_plot)
+        
+        ttk.Button(top, text="Refresh View / Scale", command=self._display_plot).pack(side="left")
+
+        self.img_lbl = ttk.Label(self.tab_visual, anchor="center")
+        self.img_lbl.pack(fill="both", expand=True, padx=10, pady=10)
+        
+        self.current_plots = {} 
+        
+        if not HAS_PIL:
+            self.img_lbl.config(
+                text="Pillow library is missing.\nPlease install it to view charts here:\n\npip install pillow\n\n(Plots are still saved to your output folder)", 
+                foreground="red", font=("Arial", 12)
+            )
+
+    def _display_plot(self, event=None):
+        if not HAS_PIL: return
+        
+        plot_name = self.plot_combo_var.get()
+        path = self.current_plots.get(plot_name)
+        if not path or not os.path.exists(path): return
+
+        try:
+            img = Image.open(path)
+            
+            # dynamically resize image so it fits comfortably inside the GUI frame
+            w, h = self.tab_visual.winfo_width(), self.tab_visual.winfo_height()
+            if w < 100: w = 900
+            if h < 100: h = 600
+            
+            # Compatible resampling for both old and new PIL versions
+            try: resample_filter = Image.Resampling.LANCZOS
+            except AttributeError: resample_filter = Image.ANTIALIAS
+            
+            img.thumbnail((w - 40, h - 60), resample_filter)
+            photo = ImageTk.PhotoImage(img)
+            
+            self.img_lbl.config(image=photo, text="")
+            self.img_lbl.image = photo
+        except Exception as e:
+            self.img_lbl.config(text=f"Failed to display plot:\n{e}", image="")
+
+    # ---------------- Model save/load ----------------
+
+    def _save_model(self):
+        if self.model_data is None: return messagebox.showwarning("No model", "Train a model first.")
+        path = filedialog.asksaveasfilename(defaultextension=".pkl", filetypes=[("Model files", "*.pkl")])
+        if path:
+            joblib.dump(self.model_data, path)
+            messagebox.showinfo("Saved", f"Model saved to:\n{path}")
+
+    def _load_model(self):
+        path = filedialog.askopenfilename(filetypes=[("Model files", "*.pkl")])
+        if not path: return
+        try:
+            self.model_data = joblib.load(path)
+            self._log(f"[INFO] Model loaded from {path}")
+            messagebox.showinfo("Loaded", "Model loaded. Go to Tab 3 to predict.")
+        except Exception as e:
+            messagebox.showerror("Load failed", str(e))
+
+    # ---------------- Queue polling ----------------
+
+    def _poll_queue(self):
+        try:
+            while True:
+                kind, payload = self.msg_queue.get_nowait()
+                if kind == "log":
+                    self.log_box.insert(tk.END, payload + "\n")
+                    self.log_box.see(tk.END)
+                elif kind == "predict_log":
+                    self.predict_log.insert(tk.END, payload + "\n")
+                    self.predict_log.see(tk.END)
+                elif kind == "new_plot":
+                    name, path = payload
+                    self.current_plots[name] = path
+                    self.plot_combo['values'] = list(self.current_plots.keys())
+                    # Auto display the first one that comes in
+                    if not self.plot_combo_var.get():
+                        self.plot_combo.current(0)
+                        self._display_plot()
+                elif kind == "train_done":
+                    self.progress.stop()
+                    self.btn_train.config(state="normal")
+                    if payload is not None:
+                        self.model_data = payload
+                        m = payload['metadata']
+                        self.log_box.insert(tk.END, f"\n[SUMMARY] Train R2={m['train_r2']} | Test R2={m['test_r2']} | Global R2={m['global_r2']}\n")
+                        self.log_box.see(tk.END)
+                        messagebox.showinfo("Training complete", f"Global R^2: {m['global_r2']}\nTest R^2: {m['test_r2']}")
+        except queue.Empty:
+            pass
+        self.after(100, self._poll_queue)
+
+
+if __name__ == "__main__":
+    app = FlightApp()
+    app.mainloop()
+
+Replace your existing _display_plot function (around line 528 at the bottom of the script) with this updated version:
+
+def _display_plot(self, event=None):
+        if not HAS_PIL: return
+        
+        plot_name = self.plot_combo_var.get()
+        path = self.current_plots.get(plot_name)
+        if not path or not os.path.exists(path): return
+
+        try:
+            # Force Tkinter to update window dimensions before measuring
+            self.update_idletasks()
+            
+            img = Image.open(path)
+            
+            # Measure the MAIN window, not the tab (which gets stretched by large images)
+            w, h = self.winfo_width(), self.winfo_height()
+            
+            # Fallback if window size isn't initialized properly yet
+            if w < 100: w = 900
+            if h < 100: h = 600
+            
+            try: resample_filter = Image.Resampling.LANCZOS
+            except AttributeError: resample_filter = Image.ANTIALIAS
+            
+            # Subtract margins for tabs (approx 80px width, 180px height for menus/buttons)
+            target_width = max(400, w - 80)
+            target_height = max(300, h - 180)
+            
+            img.thumbnail((target_width, target_height), resample_filter)
+            photo = ImageTk.PhotoImage(img)
+            
+            self.img_lbl.config(image=photo, text="")
+            self.img_lbl.image = photo
+        except Exception as e:
+            self.img_lbl.config(text=f"Failed to display plot:\n{e}", image="")
+
+
+final
+
+"""
+Flight Aerodynamic Coefficient Predictor — Desktop GUI
+=======================================================
+
+Dependencies (install once):
+    pip install pandas numpy scikit-learn xgboost matplotlib openpyxl joblib pillow
+
+Run:
+    python flight_gui.py
+"""
+
+import os
+import threading
+import queue
+import traceback
+
+import numpy as np
+import pandas as pd
+import joblib
+
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox, scrolledtext
+
+try:
+    from PIL import Image, ImageTk
+    HAS_PIL = True
+except ImportError:
+    HAS_PIL = False
+
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import OrdinalEncoder
+from sklearn.metrics import r2_score
+from xgboost import XGBRegressor
+
+OUTPUT_COLS = ['']
+
+
+# ══════════════════════════════════════════════════════════════════
+#  CORE ML LOGIC
+# ══════════════════════════════════════════════════════════════════
+
+def read_sheet1_columns(path):
+    df = pd.read_excel(path, sheet_name='Sheet1', nrows=0)
+    return df.columns.tolist()
+
+def load_flight_data(path, selected_cols):
+    df_in = pd.read_excel(path, sheet_name='Sheet1')
+    df_out = pd.read_excel(path, sheet_name='Sheet2')
+    missing = [c for c in selected_cols if c not in df_in.columns]
+    if missing:
+        raise ValueError(f"Selected columns not found in Sheet1: {missing}")
+    return df_in[selected_cols], df_out[OUTPUT_COLS]
+
+def fit_encoder(df, log_fn=print):
+    df = df.copy()
+    cat_cols = df.select_dtypes(include=['object', 'category']).columns.tolist()
+    if not cat_cols:
+        return None, cat_cols
+    for col in cat_cols:
+        df[col] = df[col].astype(str).str.strip().str.lower()
+    encoder = OrdinalEncoder(handle_unknown='use_encoded_value',
+                              unknown_value=-1, encoded_missing_value=-2)
+    encoder.fit(df[cat_cols])
+    log_fn(f"[INFO] Encoder fitted | cat cols ({len(cat_cols)}): {cat_cols}")
+    return encoder, cat_cols
+
+def encode_cat(df, encoder, cat_cols):
+    df = df.copy()
+    if not cat_cols:
+        return df
+    for col in cat_cols:
+        df[col] = df[col].astype(str).str.strip().str.lower()
+    df[cat_cols] = encoder.transform(df[cat_cols])
+    return df
+
+def preprocess_inputs(df, encoder, cat_cols, log_fn=print):
+    df_enc = encode_cat(df.copy(), encoder, cat_cols)
+    df_enc = df_enc.apply(pd.to_numeric, errors='coerce')
+    nan_counts = df_enc.isna().sum()
+    if nan_counts.any():
+        log_fn("[WARN] NaN values after encoding (filled with 0):")
+        log_fn(nan_counts[nan_counts > 0].to_string())
+    df_enc = df_enc.fillna(0)
+    return df_enc.to_numpy()
+
+def calculate_percentage_error(actual, predicted):
+    actual = np.array(actual, dtype=float)
+    predicted = np.array(predicted, dtype=float)
+    denom = np.where(np.abs(actual) < 1e-10, 1e-10, np.abs(actual))
+    return ((predicted - actual) / denom) * 100
+
+def train_xgb_model(X, y, custom_params=None, log_fn=print, stop_flag=None):
+    if custom_params is None: custom_params = {}
+        
+    X_train_raw, X_test_raw, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42, shuffle=True
+    )
+    log_fn(f"[INFO] Train: {X_train_raw.shape}  Test: {X_test_raw.shape}")
+
+    input_cols = X.columns.tolist()
+    encoder, cat_cols = fit_encoder(X_train_raw, log_fn)
+    X_train_enc = preprocess_inputs(X_train_raw, encoder, cat_cols, log_fn)
+    X_test_enc = preprocess_inputs(X_test_raw, encoder, cat_cols, log_fn)
+    
+    defaults = {}
+    raw_categories = {}
+    for col in input_cols:
+        if col in cat_cols:
+            vals = X_train_raw[col].astype(str).str.strip()
+            defaults[col] = vals.mode().iloc[0] if not vals.mode().empty else ""
+            raw_categories[col] = sorted(vals.unique().tolist())
+        else:
+            defaults[col] = float(pd.to_numeric(X_train_raw[col], errors='coerce').median())
+
+    log_fn(f"\n[STEP] Training models with custom hyperparameters...")
+
+    per_output_models = []
+    for i, col in enumerate(y.columns):
+        if stop_flag is not None and stop_flag.is_set():
+            log_fn("[INFO] Training cancelled.")
+            return None
+            
+        # Unpack all GUI parameters into XGBoost
+        xgb = XGBRegressor(
+            objective='reg:squarederror', 
+            importance_type='gain', 
+            verbosity=0,
+            **custom_params
+        )
+        
+        y_train_col = y_train.iloc[:, i]
+        y_test_col = y_test.iloc[:, i]
+        xgb.fit(X_train_enc, y_train_col, eval_set=[(X_test_enc, y_test_col)], verbose=False)
+        per_output_models.append(xgb)
+        log_fn(f"  {col}: stopped at {xgb.best_iteration} rounds")
+
+    y_pred = np.column_stack([m.predict(X_test_enc) for m in per_output_models])
+    y_train_pred = np.column_stack([m.predict(X_train_enc) for m in per_output_models])
+
+    train_r2 = r2_score(y_train, y_train_pred)
+    test_r2 = r2_score(y_test, y_pred)
+    log_fn(f"\n[RESULT] Train R^2: {train_r2:.4f}")
+    log_fn(f"[RESULT] Test R^2 : {test_r2:.4f}")
+    
+    per_coeff = {}
+    for i, col in enumerate(y.columns):
+        actual = y_test.iloc[:, i].values
+        predicted = y_pred[:, i]
+        per_coeff[col] = {'R2': round(r2_score(actual, predicted), 4)}
+
+    global_r2 = r2_score(y_test.to_numpy(), y_pred)
+    log_fn(f"[RESULT] Global R^2: {global_r2:.4f}")
+
+    return {
+        'models': per_output_models, 'encoder': encoder, 'input_cols': input_cols,
+        'cat_cols': cat_cols, 'global_r2': global_r2, 'per_coeff': per_coeff,
+        'xgb_params': custom_params, 'X_test': X_test_raw, 'y_test': y_test, 'y_pred': y_pred,
+        'defaults': defaults, 'raw_categories': raw_categories,
+        'metadata': {
+            'n_input_features': X_train_enc.shape[1], 'train_r2': round(train_r2, 4),
+            'test_r2': round(test_r2, 4), 'global_r2': round(global_r2, 4),
+        }
+    }
+
+def plot_trends(X_test, y_test, y_pred, output_cols, out_path, title_suffix="Training"):
+    if 'ALPHA' not in X_test.columns: return None
+    alpha_values = X_test['ALPHA'].values
+    idx = np.argsort(alpha_values)
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    fig.suptitle(f'{title_suffix} — Actual vs Predicted', fontsize=16, fontweight='bold')
+    axes = axes.flatten()
+    for i, col in enumerate(output_cols):
+        y_actual = y_test[col].values if hasattr(y_test, 'columns') else y_test[:, i]
+        y_p, y_a = y_pred[idx, i], y_actual[idx]
+        all_vals = np.concatenate([y_a, y_p])
+        margin = (all_vals.max() - all_vals.min()) * 0.1 or 1.0
+        axes[i].set_ylim(all_vals.min() - margin, all_vals.max() + margin)
+        axes[i].plot(alpha_values[idx], y_a, 'o-', label='Actual', alpha=0.6, markersize=4)
+        axes[i].plot(alpha_values[idx], y_p, 's--', label='Predicted', alpha=0.6, markersize=4)
+        axes[i].set_title(f'ALPHA vs {col}', fontweight='bold')
+        axes[i].set_xlabel('ALPHA (deg)')
+        axes[i].set_ylabel(col)
+        axes[i].grid(True, alpha=0.3)
+        axes[i].legend()
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    fname = os.path.join(out_path, f"{title_suffix}_Trends.png")
+    plt.savefig(fname, dpi=200, bbox_inches='tight')
+    plt.close(fig)
+    return fname
+
+def plot_percentage_errors(X_df, y_df, preds, output_cols, out_path, title_suffix="Training"):
+    if 'ALPHA' not in X_df.columns: return None, None
+    alpha_values = X_df['ALPHA'].values
+    idx = np.argsort(alpha_values)
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    fig.suptitle(f'{title_suffix} — % Error Analysis', fontsize=16, fontweight='bold')
+    axes = axes.flatten()
+    tol_rows = []
+    for i, col in enumerate(output_cols):
+        actual = y_df[col].values if hasattr(y_df, 'columns') else y_df[:, i]
+        predicted = preds[:, i]
+        pct = calculate_percentage_error(actual, predicted)
+        abs_pct = np.abs(pct)
+        total = len(pct)
+        within = int(np.sum(abs_pct < 10.0))
+        tol_rows.append({'coefficient': col, 'total_points': total, 'within_10pct': within,
+                          'pct_within_tol': round((within / total) * 100, 2)})
+        clip_top = min(50, np.percentile(abs_pct, 98) * 1.2) or 10
+        axes[i].plot(alpha_values[idx], abs_pct[idx], 'o-', color='darkred', alpha=0.6, markersize=3)
+        axes[i].axhline(5.0, color='green', linestyle='--', label='5% target')
+        axes[i].axhline(10.0, color='orange', linestyle='--', label='10% tolerance')
+        axes[i].set_title(f'{col} % Error vs ALPHA')
+        axes[i].set_ylim(0, clip_top)
+        axes[i].grid(True, alpha=0.3)
+        axes[i].legend()
+    plt.tight_layout(rect=[0, 0.03, 1, 0.95])
+    fname = os.path.join(out_path, f"{title_suffix}_PercentageErrors.png")
+    plt.savefig(fname, dpi=200, bbox_inches='tight')
+    plt.close(fig)
+    return fname, pd.DataFrame(tol_rows)
+
+def predict_from_file(model_data, test_path, out_dir, log_fn=print):
+    df_in = pd.read_excel(test_path, sheet_name='Sheet1')
+    df_out = pd.read_excel(test_path, sheet_name='Sheet2')
+    input_cols = model_data['input_cols']
+    missing = set(input_cols) - set(df_in.columns)
+    if missing:
+        log_fn(f"[WARN] Missing columns in test file (filled with 0): {missing}")
+        for c in missing: df_in[c] = 0
+
+    X_enc = preprocess_inputs(df_in[input_cols], model_data['encoder'], model_data['cat_cols'], log_fn)
+    preds = np.column_stack([m.predict(X_enc) for m in model_data['models']])
+
+    result_df = pd.DataFrame()
+    if 'ALPHA' in df_in.columns: result_df['ALPHA'] = df_in['ALPHA'].values
+    for i, col in enumerate(OUTPUT_COLS):
+        actual = df_out[col].values if col in df_out.columns else np.full(len(df_in), np.nan)
+        predicted = preds[:, i]
+        result_df[f'{col}_Actual'] = actual
+        result_df[f'{col}_Predicted'] = predicted
+        result_df[f'{col}_%Error'] = calculate_percentage_error(actual, predicted)
+
+    trend_png = plot_trends(df_in, df_out[OUTPUT_COLS], preds, OUTPUT_COLS, out_dir, "Test_File")
+    err_png, df_tol = plot_percentage_errors(df_in, df_out[OUTPUT_COLS], preds, OUTPUT_COLS, out_dir, "Test_File")
+
+    final_path = os.path.join(out_dir, "Predictions.xlsx")
+    with pd.ExcelWriter(final_path, engine='openpyxl') as writer:
+        result_df.to_excel(writer, sheet_name='Predictions', index=False)
+        if df_tol is not None: df_tol.to_excel(writer, sheet_name='Tolerance_Summary', index=False)
+
+    return result_df, df_tol, final_path, trend_png, err_png
+
+def predict_manual(model_data, feature_values: dict):
+    row = {c: feature_values.get(c, model_data['defaults'].get(c, 0)) for c in model_data['input_cols']}
+    X_enc = preprocess_inputs(pd.DataFrame([row]), model_data['encoder'], model_data['cat_cols'], log_fn=lambda *_: None)
+    preds = np.column_stack([m.predict(X_enc) for m in model_data['models']])
+    return dict(zip(OUTPUT_COLS, preds[0]))
+
+
+# ══════════════════════════════════════════════════════════════════
+#  GUI
+# ══════════════════════════════════════════════════════════════════
+
+class ScrollableFrame(ttk.Frame):
+    """A frame with a robust cross-platform mouse wheel scroll integration."""
+    def __init__(self, parent, height=350, **kwargs):
+        super().__init__(parent, **kwargs)
+        self.canvas = tk.Canvas(self, height=height, highlightthickness=0)
+        scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.inner = ttk.Frame(self.canvas)
+
+        self.inner.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+        self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
+        self.canvas.configure(yscrollcommand=scrollbar.set)
+
+        self.canvas.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        self.canvas.bind("<Enter>", self._bind_mouse)
+        self.canvas.bind("<Leave>", self._unbind_mouse)
+
+    def _on_mousewheel(self, event):
+        if hasattr(event, 'num') and event.num == 4: self.canvas.yview_scroll(-1, "units")
+        elif hasattr(event, 'num') and event.num == 5: self.canvas.yview_scroll(1, "units")
+        elif hasattr(event, 'delta') and event.delta != 0:
+            direction = -1 if event.delta > 0 else 1
+            self.canvas.yview_scroll(direction, "units")
+
+    def _bind_mouse(self, event):
+        self.canvas.bind_all("<MouseWheel>", self._on_mousewheel)
+        self.canvas.bind_all("<Button-4>", self._on_mousewheel)
+        self.canvas.bind_all("<Button-5>", self._on_mousewheel)
+
+    def _unbind_mouse(self, event):
+        self.canvas.unbind_all("<MouseWheel>")
+        self.canvas.unbind_all("<Button-4>")
+        self.canvas.unbind_all("<Button-5>")
+
+
+class FlightApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("Flight Aerodynamic Coefficient Predictor")
+        self.geometry("980x780")
+
+        self.training_path = None
+        self.all_columns = []
+        self.feature_vars = {}
+        self.checkbox_widgets = {}
+        self.output_dir = os.getcwd()
+        self.model_data = None
+        self.hp_vars = {} # Stores all hyperparameter variables
+
+        self.msg_queue = queue.Queue()
+        self.stop_flag = threading.Event()
+
+        self._build_ui()
+        self.after(100, self._poll_queue)
+
+    def _build_ui(self):
+        nb = ttk.Notebook(self)
+        nb.pack(fill="both", expand=True, padx=8, pady=8)
+
+        self.tab_data = ttk.Frame(nb)
+        self.tab_train = ttk.Frame(nb)
+        self.tab_predict = ttk.Frame(nb)
+        self.tab_visual = ttk.Frame(nb)
+        
+        nb.add(self.tab_data, text="1. Data & Features")
+        nb.add(self.tab_train, text="2. Train Model")
+        nb.add(self.tab_predict, text="3. Predict")
+        nb.add(self.tab_visual, text="4. Visualize Results")
+
+        self._build_tab_data()
+        self._build_tab_train()
+        self._build_tab_predict()
+        self._build_tab_visualize()
+
+    # ---------------- Tab 1: Data & Features ----------------
+
+    def _build_tab_data(self):
+        top = ttk.Frame(self.tab_data)
+        top.pack(fill="x", padx=10, pady=10)
+
+        ttk.Button(top, text="Browse Training File", command=self._browse_training_file).pack(side="left")
+        ttk.Button(top, text="Clear File", command=self._clear_training_file).pack(side="left", padx=5)
+        
+        self.lbl_train_path = ttk.Label(top, text="No file loaded", foreground="gray")
+        self.lbl_train_path.pack(side="left", padx=10)
+
+        filt_row = ttk.Frame(self.tab_data)
+        filt_row.pack(fill="x", padx=10)
+        ttk.Label(filt_row, text="Filter:").pack(side="left")
+        self.filter_var = tk.StringVar()
+        self.filter_var.trace_add("write", lambda *a: self._apply_filter())
+        ttk.Entry(filt_row, textvariable=self.filter_var, width=30).pack(side="left", padx=5)
+        ttk.Button(filt_row, text="Select All", command=lambda: self._set_all(True)).pack(side="left", padx=5)
+        ttk.Button(filt_row, text="Deselect All", command=lambda: self._set_all(False)).pack(side="left")
+
+        self.lbl_count = ttk.Label(filt_row, text="0 of 0 selected", foreground="blue")
+        self.lbl_count.pack(side="right")
+
+        self.scroll_frame = ScrollableFrame(self.tab_data, height=500)
+        self.scroll_frame.pack(fill="both", expand=True, padx=10, pady=10)
+
+    def _browse_training_file(self):
+        path = filedialog.askopenfilename(filetypes=[("Excel files", "*.xlsx")])
+        if not path: return
+        try: cols = read_sheet1_columns(path)
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not read Sheet1 from file:\n{e}")
+            return
+
+        self.training_path = path
+        self.all_columns = cols
+        self.lbl_train_path.config(text=os.path.basename(path), foreground="black")
+
+        for w in self.scroll_frame.inner.winfo_children(): w.destroy()
+        self.feature_vars.clear()
+        self.checkbox_widgets.clear()
+
+        for i, col in enumerate(cols):
+            var = tk.BooleanVar(value=True)
+            cb = ttk.Checkbutton(self.scroll_frame.inner, text=col, variable=var, command=self._update_count)
+            cb.grid(row=i // 3, column=i % 3, sticky="w", padx=8, pady=2)
+            self.feature_vars[col] = var
+            self.checkbox_widgets[col] = cb
+        self._update_count()
+
+    def _clear_training_file(self):
+        self.training_path = None
+        self.all_columns = []
+        self.lbl_train_path.config(text="No file loaded", foreground="gray")
+        for w in self.scroll_frame.inner.winfo_children(): w.destroy()
+        self.feature_vars.clear()
+        self.checkbox_widgets.clear()
+        self._update_count()
+
+    def _apply_filter(self):
+        needle = self.filter_var.get().strip().lower()
+        for col, cb in self.checkbox_widgets.items():
+            if needle in col.lower(): cb.grid()
+            else: cb.grid_remove()
+
+    def _set_all(self, value):
+        needle = self.filter_var.get().strip().lower()
+        for col, var in self.feature_vars.items():
+            if needle in col.lower(): var.set(value)
+        self._update_count()
+
+    def _update_count(self):
+        selected = sum(v.get() for v in self.feature_vars.values())
+        total = len(self.feature_vars)
+        self.lbl_count.config(text=f"{selected} of {total} selected")
+
+    def get_selected_columns(self):
+        return [c for c, v in self.feature_vars.items() if v.get()]
+
+    # ---------------- Tab 2: Train ----------------
+
+    def _build_tab_train(self):
+        top = ttk.Frame(self.tab_train)
+        top.pack(fill="x", padx=10, pady=5)
+        ttk.Button(top, text="Choose Output Folder", command=self._choose_output_dir).pack(side="left")
+        self.lbl_out_dir = ttk.Label(top, text=self.output_dir, foreground="gray")
+        self.lbl_out_dir.pack(side="left", padx=10)
+
+        # Multi-row Grid for ALL Hyperparameters
+        hp_frame = ttk.LabelFrame(self.tab_train, text="XGBoost Hyperparameters")
+        hp_frame.pack(fill="x", padx=10, pady=5)
+        
+        # Format: (Dictionary Key, GUI Label, Default Value)
+        hp_config = [
+            ("n_estimators", "Estimators:", "2500"),
+            ("learning_rate", "Learning Rate:", "0.02"),
+            ("max_depth", "Max Depth:", "4"),
+            ("early_stopping_rounds", "Early Stop:", "50"),
+            
+            ("min_child_weight", "Child Weight:", "10"),
+            ("subsample", "Subsample:", "0.8"),
+            ("colsample_bytree", "Colsample:", "0.8"),
+            ("max_bin", "Max Bin:", "256"),
+            
+            ("reg_alpha", "L1 (Alpha):", "0.1"),
+            ("reg_lambda", "L2 (Lambda):", "5"),
+            ("gamma", "Gamma:", "0.1"),
+            ("random_state", "Random State:", "42")
+        ]
+
+        # Draw text boxes in a 4-column grid
+        for i, (key, label, default) in enumerate(hp_config):
+            row, col = divmod(i, 4)
+            ttk.Label(hp_frame, text=label).grid(row=row, column=col*2, sticky="e", padx=(10, 2), pady=4)
+            var = tk.StringVar(value=default)
+            self.hp_vars[key] = var
+            ttk.Entry(hp_frame, textvariable=var, width=8).grid(row=row, column=col*2+1, sticky="w", padx=2, pady=4)
+
+        # Dropdown for Tree Method
+        row, col = divmod(len(hp_config), 4)
+        ttk.Label(hp_frame, text="Tree Method:").grid(row=row, column=col*2, sticky="e", padx=(10, 2), pady=4)
+        self.hp_vars['tree_method'] = tk.StringVar(value="hist")
+        ttk.Combobox(hp_frame, textvariable=self.hp_vars['tree_method'], values=['hist', 'exact', 'approx'], width=7, state="readonly").grid(row=row, column=col*2+1, sticky="w", padx=2, pady=4)
+
+        # Buttons
+        btn_row = ttk.Frame(self.tab_train)
+        btn_row.pack(fill="x", padx=10, pady=5)
+        self.btn_train = ttk.Button(btn_row, text="Train Model", command=self._start_training)
+        self.btn_train.pack(side="left")
+        ttk.Button(btn_row, text="Save Model (.pkl)", command=self._save_model).pack(side="left", padx=8)
+        ttk.Button(btn_row, text="Load Model (.pkl)", command=self._load_model).pack(side="left")
+
+        self.progress = ttk.Progressbar(self.tab_train, mode="indeterminate")
+        self.progress.pack(fill="x", padx=10, pady=5)
+
+        self.log_box = scrolledtext.ScrolledText(self.tab_train, height=20, font=("Consolas", 9))
+        self.log_box.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+    def _choose_output_dir(self):
+        d = filedialog.askdirectory()
+        if d:
+            self.output_dir = d
+            self.lbl_out_dir.config(text=d, foreground="black")
+
+    def _log(self, msg): self.msg_queue.put(("log", str(msg)))
+
+    def _start_training(self):
+        if not self.training_path:
+            messagebox.showwarning("No file", "Load a training file on Tab 1 first.")
+            return
+        selected = self.get_selected_columns()
+        if len(selected) == 0:
+            messagebox.showwarning("No features", "Select at least one feature on Tab 1.")
+            return
+            
+        # Parse all hyperparameters
+        custom_params = {}
+        try:
+            custom_params['n_estimators'] = int(self.hp_vars['n_estimators'].get())
+            custom_params['learning_rate'] = float(self.hp_vars['learning_rate'].get())
+            custom_params['max_depth'] = int(self.hp_vars['max_depth'].get())
+            custom_params['early_stopping_rounds'] = int(self.hp_vars['early_stopping_rounds'].get())
+            custom_params['min_child_weight'] = float(self.hp_vars['min_child_weight'].get())
+            custom_params['subsample'] = float(self.hp_vars['subsample'].get())
+            custom_params['colsample_bytree'] = float(self.hp_vars['colsample_bytree'].get())
+            custom_params['max_bin'] = int(self.hp_vars['max_bin'].get())
+            custom_params['reg_alpha'] = float(self.hp_vars['reg_alpha'].get())
+            custom_params['reg_lambda'] = float(self.hp_vars['reg_lambda'].get())
+            custom_params['gamma'] = float(self.hp_vars['gamma'].get())
+            custom_params['random_state'] = int(self.hp_vars['random_state'].get())
+            custom_params['tree_method'] = self.hp_vars['tree_method'].get()
+        except ValueError:
+            messagebox.showerror("Invalid Parameter", "Please ensure all text boxes contain valid numbers.")
+            return
+
+        self.log_box.delete("1.0", tk.END)
+        self.btn_train.config(state="disabled")
+        self.progress.start(10)
+        self.stop_flag.clear()
+        
+        t = threading.Thread(target=self._train_worker, args=(selected, custom_params), daemon=True)
+        t.start()
+
+    def _train_worker(self, selected_cols, custom_params):
+        try:
+            X, y = load_flight_data(self.training_path, selected_cols)
+            self._log(f"[INFO] Training samples: {len(X)}  |  Selected features: {len(selected_cols)}")
+            results = train_xgb_model(X, y, custom_params=custom_params, log_fn=self._log, stop_flag=self.stop_flag)
+            
+            if results is None:
+                self.msg_queue.put(("train_done", None))
+                return
+
+            os.makedirs(self.output_dir, exist_ok=True)
+            
+            # Auto-save Model Feature
+            auto_save_path = os.path.join(self.output_dir, "Auto_Saved_Model.pkl")
+            joblib.dump(results, auto_save_path)
+            self._log(f"\n[INFO] Model Auto-Saved -> {auto_save_path}")
+            
+            # Plots
+            tp = plot_trends(results['X_test'], results['y_test'], results['y_pred'], OUTPUT_COLS, self.output_dir, "Training")
+            ep, df_tol = plot_percentage_errors(results['X_test'], results['y_test'], results['y_pred'], OUTPUT_COLS, self.output_dir, "Training")
+            
+            if tp:
+                self._log(f"[INFO] Trend plot saved -> {tp}")
+                self.msg_queue.put(("new_plot", ("Training - Actual vs Predicted", tp)))
+            if ep:
+                self._log(f"[INFO] Error plot saved -> {ep}")
+                self.msg_queue.put(("new_plot", ("Training - % Error", ep)))
+
+            self.msg_queue.put(("train_done", results))
+        except Exception:
+            self._log("[ERROR] Training failed:\n" + traceback.format_exc())
+            self.msg_queue.put(("train_done", None))
+
+    # ---------------- Tab 3: Predict ----------------
+
+    def _build_tab_predict(self):
+        mode_row = ttk.Frame(self.tab_predict)
+        mode_row.pack(fill="x", padx=10, pady=10)
+        self.predict_mode = tk.StringVar(value="file")
+        ttk.Radiobutton(mode_row, text="Predict from Test File", variable=self.predict_mode,
+                        value="file", command=self._refresh_predict_view).pack(side="left")
+        ttk.Radiobutton(mode_row, text="Manual Entry", variable=self.predict_mode,
+                        value="manual", command=self._refresh_predict_view).pack(side="left", padx=15)
+
+        self.predict_body = ttk.Frame(self.tab_predict)
+        self.predict_body.pack(fill="both", expand=True, padx=10, pady=10)
+
+        self._build_predict_file_view()
+        self._build_predict_manual_view()
+        self._refresh_predict_view()
+
+    def _build_predict_file_view(self):
+        self.frame_predict_file = ttk.Frame(self.predict_body)
+        top = ttk.Frame(self.frame_predict_file)
+        top.pack(fill="x")
+        ttk.Button(top, text="Browse Test File", command=self._browse_test_file).pack(side="left")
+        self.lbl_test_path = ttk.Label(top, text="No file selected", foreground="gray")
+        self.lbl_test_path.pack(side="left", padx=10)
+        ttk.Button(top, text="Run Prediction", command=self._run_file_prediction).pack(side="left", padx=10)
+
+        self.predict_log = scrolledtext.ScrolledText(self.frame_predict_file, height=28, font=("Consolas", 9))
+        self.predict_log.pack(fill="both", expand=True, pady=10)
+        self.test_path = None
+
+    def _build_predict_manual_view(self):
+        self.frame_predict_manual = ttk.Frame(self.predict_body)
+        top = ttk.Frame(self.frame_predict_manual)
+        top.pack(fill="x")
+        ttk.Label(top, text="Values default to training median / most common category.", foreground="gray").pack(side="left")
+        ttk.Button(top, text="Predict", command=self._run_manual_prediction).pack(side="right")
+
+        self.manual_scroll = ScrollableFrame(self.frame_predict_manual, height=420)
+        self.manual_scroll.pack(fill="both", expand=True, pady=10)
+        self.manual_entries = {}
+
+        self.manual_result = ttk.LabelFrame(self.frame_predict_manual, text="Predicted Coefficients")
+        self.manual_result.pack(fill="x", pady=5)
+        self.manual_result_labels = {}
+        for i, col in enumerate(OUTPUT_COLS):
+            ttk.Label(self.manual_result, text=f"{col}:").grid(row=0, column=2 * i, sticky="e", padx=4, pady=6)
+            lbl = ttk.Label(self.manual_result, text="—", width=10, foreground="blue", font=("Consolas", 10, "bold"))
+            lbl.grid(row=0, column=2 * i + 1, sticky="w", padx=2)
+            self.manual_result_labels[col] = lbl
+
+    def _refresh_predict_view(self):
+        self.frame_predict_file.pack_forget()
+        self.frame_predict_manual.pack_forget()
+        if self.predict_mode.get() == "file": self.frame_predict_file.pack(fill="both", expand=True)
+        else:
+            self.frame_predict_manual.pack(fill="both", expand=True)
+            self._populate_manual_form()
+
+    def _populate_manual_form(self):
+        for w in self.manual_scroll.inner.winfo_children(): w.destroy()
+        self.manual_entries.clear()
+
+        if self.model_data is None:
+            ttk.Label(self.manual_scroll.inner, text="Train or load a model first (Tab 2).", foreground="red").grid(row=0, column=0, padx=10, pady=10)
+            return
+
+        cols = self.model_data['input_cols']
+        cat_cols = set(self.model_data['cat_cols'])
+        raw_categories = self.model_data.get('raw_categories', {})
+        defaults = self.model_data.get('defaults', {})
+
+        for i, col in enumerate(cols):
+            r, c = divmod(i, 2)
+            ttk.Label(self.manual_scroll.inner, text=col).grid(row=r, column=c * 2, sticky="e", padx=6, pady=3)
+            if col in cat_cols:
+                var = tk.StringVar(value=str(defaults.get(col, "")))
+                widget = ttk.Combobox(self.manual_scroll.inner, textvariable=var, values=raw_categories.get(col, []), width=18, state="normal")
+            else:
+                var = tk.StringVar(value=str(defaults.get(col, 0)))
+                widget = ttk.Entry(self.manual_scroll.inner, textvariable=var, width=20)
+            widget.grid(row=r, column=c * 2 + 1, sticky="w", padx=6, pady=3)
+            self.manual_entries[col] = var
+
+    def _run_manual_prediction(self):
+        if self.model_data is None:
+            messagebox.showwarning("No model", "Train or load a model first.")
+            return
+        values = {}
+        for col, var in self.manual_entries.items():
+            raw = var.get()
+            if col in self.model_data['cat_cols']: values[col] = raw
+            else:
+                try: values[col] = float(raw)
+                except ValueError:
+                    messagebox.showerror("Invalid value", f"'{raw}' is not a number for '{col}'.")
+                    return
+        try: preds = predict_manual(self.model_data, values)
+        except Exception:
+            messagebox.showerror("Prediction failed", traceback.format_exc())
+            return
+        for col, lbl in self.manual_result_labels.items():
+            lbl.config(text=f"{preds[col]:.5f}")
+
+    def _browse_test_file(self):
+        path = filedialog.askopenfilename(filetypes=[("Excel files", "*.xlsx")])
+        if path:
+            self.test_path = path
+            self.lbl_test_path.config(text=os.path.basename(path), foreground="black")
+
+    def _run_file_prediction(self):
+        if self.model_data is None:
+            messagebox.showwarning("No model", "Train or load a model first (Tab 2).")
+            return
+        if not self.test_path:
+            messagebox.showwarning("No file", "Choose a test file first.")
+            return
+
+        self.predict_log.delete("1.0", tk.END)
+
+        def worker():
+            def log(msg): self.msg_queue.put(("predict_log", str(msg)))
+            try:
+                os.makedirs(self.output_dir, exist_ok=True)
+                df_result, df_tol, path, trend_png, err_png = predict_from_file(self.model_data, self.test_path, self.output_dir, log)
+                
+                if trend_png: self.msg_queue.put(("new_plot", ("Test - Actual vs Predicted", trend_png)))
+                if err_png: self.msg_queue.put(("new_plot", ("Test - % Error", err_png)))
+
+                log("\n[TOLERANCE SUMMARY]")
+                if df_tol is not None: log(df_tol.to_string(index=False))
+                log(f"\n[DONE] Results saved to: {path}")
+            except Exception:
+                log("[ERROR] Prediction failed:\n" + traceback.format_exc())
+        threading.Thread(target=worker, daemon=True).start()
+
+    # ---------------- Tab 4: Visualize Results ----------------
+    
+    def _build_tab_visualize(self):
+        top = ttk.Frame(self.tab_visual)
+        top.pack(fill="x", padx=10, pady=10)
+        
+        ttk.Label(top, text="Select Plot to View:").pack(side="left")
+        self.plot_combo_var = tk.StringVar()
+        self.plot_combo = ttk.Combobox(top, textvariable=self.plot_combo_var, state="readonly", width=40)
+        self.plot_combo.pack(side="left", padx=10)
+        self.plot_combo.bind("<<ComboboxSelected>>", self._display_plot)
+        
+        ttk.Button(top, text="Refresh View / Scale", command=self._display_plot).pack(side="left")
+
+        self.img_lbl = ttk.Label(self.tab_visual, anchor="center")
+        self.img_lbl.pack(fill="both", expand=True, padx=10, pady=10)
+        
+        self.current_plots = {} 
+        
+        if not HAS_PIL:
+            self.img_lbl.config(
+                text="Pillow library is missing.\nPlease install it to view charts here:\n\npip install pillow\n\n(Plots are still saved to your output folder)", 
+                foreground="red", font=("Arial", 12)
+            )
+
+    def _display_plot(self, event=None):
+        if not HAS_PIL: return
+        plot_name = self.plot_combo_var.get()
+        path = self.current_plots.get(plot_name)
+        if not path or not os.path.exists(path): return
+
+        try:
+            # Force Tkinter to update window dimensions
+            self.update_idletasks()
+            img = Image.open(path)
+            
+            # Measure MAIN window size instead of stretched tab frame
+            w, h = self.winfo_width(), self.winfo_height()
+            if w < 100: w = 900
+            if h < 100: h = 600
+            
+            try: resample_filter = Image.Resampling.LANCZOS
+            except AttributeError: resample_filter = Image.ANTIALIAS
+            
+            # Subtract margins for tabs (approx 80px width, 180px height for menus/buttons)
+            target_width = max(400, w - 80)
+            target_height = max(300, h - 180)
+            
+            img.thumbnail((target_width, target_height), resample_filter)
+            photo = ImageTk.PhotoImage(img)
+            
+            self.img_lbl.config(image=photo, text="")
+            self.img_lbl.image = photo
+        except Exception as e:
+            self.img_lbl.config(text=f"Failed to display plot:\n{e}", image="")
+
+    # ---------------- Model save/load ----------------
+
+    def _save_model(self):
+        if self.model_data is None: return messagebox.showwarning("No model", "Train a model first.")
+        path = filedialog.asksaveasfilename(defaultextension=".pkl", filetypes=[("Model files", "*.pkl")])
+        if path:
+            joblib.dump(self.model_data, path)
+            messagebox.showinfo("Saved", f"Model saved to:\n{path}")
+
+    def _load_model(self):
+        path = filedialog.askopenfilename(filetypes=[("Model files", "*.pkl")])
+        if not path: return
+        try:
+            self.model_data = joblib.load(path)
+            self._log(f"[INFO] Model loaded from {path}")
+            messagebox.showinfo("Loaded", "Model loaded. Go to Tab 3 to predict.")
+        except Exception as e:
+            messagebox.showerror("Load failed", str(e))
+
+    # ---------------- Queue polling ----------------
+
+    def _poll_queue(self):
+        try:
+            while True:
+                kind, payload = self.msg_queue.get_nowait()
+                if kind == "log":
+                    self.log_box.insert(tk.END, payload + "\n")
+                    self.log_box.see(tk.END)
+                elif kind == "predict_log":
+                    self.predict_log.insert(tk.END, payload + "\n")
+                    self.predict_log.see(tk.END)
+                elif kind == "new_plot":
+                    name, path = payload
+                    self.current_plots[name] = path
+                    self.plot_combo['values'] = list(self.current_plots.keys())
+                    if not self.plot_combo_var.get():
+                        self.plot_combo.current(0)
+                        self._display_plot()
+                elif kind == "train_done":
+                    self.progress.stop()
+                    self.btn_train.config(state="normal")
+                    if payload is not None:
+                        self.model_data = payload
+                        m = payload['metadata']
+                        self.log_box.insert(tk.END, f"\n[SUMMARY] Train R2={m['train_r2']} | Test R2={m['test_r2']} | Global R2={m['global_r2']}\n")
+                        self.log_box.see(tk.END)
+                        messagebox.showinfo("Training complete", f"Global R^2: {m['global_r2']}\nTest R^2: {m['test_r2']}")
+        except queue.Empty:
+            pass
+        self.after(100, self._poll_queue)
+
+
+if __name__ == "__main__":
+    app = FlightApp()
+    app.mainloop()
